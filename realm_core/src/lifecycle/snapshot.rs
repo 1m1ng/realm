@@ -110,7 +110,18 @@ impl SnapshotStore {
         // same directory, so the rename stays within one filesystem
         let tmp = self.path.with_extension("json.tmp");
         {
-            let mut file = fs::File::create(&tmp)?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+
+            // the snapshot spells out every forwarding rule, transport
+            // parameters included: it is nobody else's business
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+
+            let mut file = options.open(&tmp)?;
             file.write_all(&data)?;
             file.sync_all()?;
         }

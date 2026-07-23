@@ -216,6 +216,28 @@ fn a_leftover_temporary_file_does_not_shadow_the_snapshot() {
     assert_eq!(loaded.endpoints.len(), 1);
 }
 
+/// The snapshot spells out every forwarding rule, so it must not be readable
+/// by other users.
+#[cfg(unix)]
+#[test]
+fn the_snapshot_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new("perms");
+    let store = SnapshotStore::new(dir.join("state.json"));
+
+    store
+        .store(&Snapshot::<TestSpec> {
+            generation: 1,
+            partial: false,
+            endpoints: Default::default(),
+        })
+        .unwrap();
+
+    let mode = std::fs::metadata(dir.join("state.json")).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the snapshot must not be readable by others");
+}
+
 /// A corrupt snapshot is reported, never a panic and never a silent wipe.
 #[test]
 fn a_corrupt_snapshot_is_an_error() {

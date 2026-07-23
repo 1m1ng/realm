@@ -424,13 +424,20 @@ async fn malformed_requests_and_unknown_routes_are_terminal() {
     assert_eq!(body["error"]["kind"], "unknown-route");
 }
 
-/// Covers R12/R30: socket and directory are owner-only.
+/// Covers R12/R30: the socket is owner-only, and so is a directory realm
+/// creates for it.
 #[tokio::test]
 async fn the_socket_is_owner_only() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = TempDir::new("perms");
-    let (socket, _shutdown) = serve(&dir, Reconciler::new()).await;
+    // a path realm has to create itself
+    let socket = dir.0.join("run").join("realm.sock");
+
+    let shutdown = CancellationToken::new();
+    let server = ControlServer::new(Reconciler::<EndpointConf>::new().spawn(), Default::default(), &socket);
+    let listener = server.bind().await.expect("control socket binds");
+    tokio::spawn(server.serve(listener, shutdown));
 
     let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700, "the socket must not be reachable by others");
@@ -440,7 +447,42 @@ async fn the_socket_is_owner_only() {
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(dir_mode, 0o700, "the directory must not be traversable by others");
+    assert_eq!(
+        dir_mode, 0o700,
+        "a directory realm creates must not be traversable by others"
+    );
+
+    let (code, _) = call(&socket, "GET", "/v1/version", None).await;
+    assert_eq!(code, 200);
+}
+
+/// An existing directory is never tightened behind the operator's back: a
+/// control socket in a shared directory like /run must not take that directory
+/// away from everybody else.
+#[tokio::test]
+async fn an_existing_directory_keeps_its_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new("shared-dir");
+    let shared = dir.0.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let socket = shared.join("realm.sock");
+    let shutdown = CancellationToken::new();
+    let server = ControlServer::new(Reconciler::<EndpointConf>::new().spawn(), Default::default(), &socket);
+    let listener = server.bind().await.expect("binding in a shared directory works");
+    tokio::spawn(server.serve(listener, shutdown));
+
+    let mode = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755, "an existing directory keeps the permissions it had");
+
+    // the socket itself is still owner-only
+    let socket_mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+    assert_eq!(socket_mode, 0o700);
+
+    let (code, _) = call(&socket, "GET", "/v1/version", None).await;
+    assert_eq!(code, 200);
 }
 
 /// Covers R30: a socket left behind by a crashed process is replaced, but a

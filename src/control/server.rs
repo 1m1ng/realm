@@ -22,8 +22,34 @@ use crate::conf::{EndpointConf, NetConf};
 
 use super::api::{ApiState, handle};
 
-/// Permissions of the socket and of the directory holding it (R30).
+/// Permissions of the socket and of a directory realm creates for it (R30).
 const OWNER_ONLY: u32 = 0o700;
+
+/// Make sure the directory holding the socket exists and is owner-only.
+///
+/// Only a directory realm creates itself is tightened: an existing one may be
+/// shared (`/run`, `/tmp`), and silently taking it away from everybody else
+/// would be far worse than the exposure it is meant to prevent. An existing
+/// directory that others can reach is reported instead — the socket itself is
+/// still owner-only, so this is about closing the window between `bind` and
+/// `chmod`, not about the socket's own permissions.
+fn prepare_directory(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        let mode = fs::metadata(dir)?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            log::warn!(
+                "[control]{:?} is reachable by other users (mode {:o}); \
+                 prefer a directory only this process's user can enter",
+                dir,
+                mode
+            );
+        }
+        return Ok(());
+    }
+
+    fs::create_dir_all(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(OWNER_ONLY))
+}
 
 /// Bind the control socket, cleaning up after a crashed predecessor.
 ///
@@ -33,8 +59,7 @@ const OWNER_ONLY: u32 = 0o700;
 pub async fn bind(path: &Path) -> io::Result<UnixListener> {
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
-            fs::create_dir_all(dir)?;
-            fs::set_permissions(dir, fs::Permissions::from_mode(OWNER_ONLY))?;
+            prepare_directory(dir)?;
         }
     }
 
