@@ -14,24 +14,18 @@ use realm_core::endpoint::{RemoteAddr, UdpRuntime};
 use realm_core::lifecycle::{CancellationToken, Cohort};
 use realm_core::udp::{bind_udp, serve_udp};
 
-/// An echo server that answers every datagram until the test drops it.
-async fn spawn_echo() -> std::net::SocketAddr {
-    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let addr = sock.local_addr().unwrap();
+mod common;
+use common::{open_fds, spawn_udp_echo};
 
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 1500];
-        loop {
-            let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
-                return;
-            };
-            if sock.send_to(&buf[..n], peer).await.is_err() {
-                return;
-            }
-        }
-    });
-
-    addr
+/// Send a datagram through the relay and assert the echo comes back intact.
+async fn roundtrip(client: &UdpSocket, relay: std::net::SocketAddr, payload: &[u8]) {
+    client.send_to(payload, relay).await.unwrap();
+    let mut buf = vec![0u8; 1500];
+    let (n, _) = timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+        .await
+        .expect("relay must answer in time")
+        .unwrap();
+    assert_eq!(&buf[..n], payload);
 }
 
 fn runtime_for(remote: std::net::SocketAddr) -> Arc<UdpRuntime> {
@@ -41,27 +35,12 @@ fn runtime_for(remote: std::net::SocketAddr) -> Arc<UdpRuntime> {
     })
 }
 
-async fn roundtrip(client: &UdpSocket, relay: std::net::SocketAddr, payload: &[u8]) {
-    client.send_to(payload, relay).await.unwrap();
-    let mut buf = vec![0u8; 1500];
-    let (n, _) = timeout(Duration::from_secs(2), client.recv_from(&mut buf))
-        .await
-        .expect("relay must answer in time")
-        .unwrap();
-    assert_eq!(&buf[..n], payload);
-}
-
-#[cfg(target_os = "linux")]
-fn open_fds() -> usize {
-    std::fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(0)
-}
-
 /// Covers AE7: a stopped udp endpoint terminates its associations in a
 /// controlled way — every task exits, the count drops to zero, and the
 /// outbound sockets are released.
 #[tokio::test]
 async fn stopping_an_endpoint_terminates_all_associations() {
-    let echo = spawn_echo().await;
+    let echo = spawn_udp_echo("").await;
 
     let lis = bind_udp(&"127.0.0.1:0".parse().unwrap(), Default::default()).unwrap();
     let laddr = lis.local_addr().unwrap();
@@ -112,7 +91,7 @@ async fn stopping_an_endpoint_terminates_all_associations() {
 /// fresh association against the new configuration.
 #[tokio::test]
 async fn associations_are_rebuilt_after_a_restart() {
-    let echo = spawn_echo().await;
+    let echo = spawn_udp_echo("").await;
     let laddr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     let lis = bind_udp(&laddr, Default::default()).unwrap();
@@ -134,7 +113,7 @@ async fn associations_are_rebuilt_after_a_restart() {
         .expect("old associations exit");
 
     // rebind the same port and serve a new generation
-    let echo2 = spawn_echo().await;
+    let echo2 = spawn_udp_echo("").await;
     let lis = bind_udp(&bound, Default::default()).unwrap();
     let second = Cohort::new();
     let shutdown2 = CancellationToken::new();

@@ -6,18 +6,19 @@
 //! reuses the partially-applied semantics when some endpoint cannot come back.
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::timeout;
 
 use realm_core::endpoint::{Endpoint, RemoteAddr};
 use realm_core::lifecycle::{
     DesiredEndpoint, EndpointSource, EndpointSpec, ReconcileError, ReconcileRequest, Reconciler, Snapshot,
     SnapshotStore,
 };
+
+mod common;
+use common::{TempDir, ask, free_addr, spawn_echo};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct TestSpec {
@@ -44,76 +45,6 @@ impl EndpointSource for TestSpec {
             udp: false,
             drain: None,
         })
-    }
-}
-
-async fn spawn_echo(tag: &'static str) -> SocketAddr {
-    let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = lis.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = lis.accept().await else {
-                return;
-            };
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 64];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => {
-                            let mut answer = Vec::from(tag.as_bytes());
-                            answer.extend_from_slice(&buf[..n]);
-                            if stream.write_all(&answer).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-
-    addr
-}
-
-fn free_addr() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-}
-
-async fn ask(stream: &mut TcpStream, payload: &[u8]) -> String {
-    stream.write_all(payload).await.unwrap();
-    let mut buf = vec![0u8; 128];
-    let n = timeout(Duration::from_secs(2), stream.read(&mut buf))
-        .await
-        .expect("relay must answer in time")
-        .expect("relay must stay readable");
-    String::from_utf8_lossy(&buf[..n]).into_owned()
-}
-
-/// A private directory for one test's snapshot, removed on drop.
-struct TempDir(std::path::PathBuf);
-
-impl TempDir {
-    fn new(name: &str) -> Self {
-        let mut path = std::env::temp_dir();
-        path.push(format!("realm-snapshot-{}-{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-
-    fn file(&self) -> std::path::PathBuf {
-        self.0.join("state.json")
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -144,7 +75,7 @@ async fn a_restarted_process_restores_its_snapshot() {
 
     // first process: apply and shut down
     {
-        let mut rec = Reconciler::with_snapshot(SnapshotStore::new(dir.file()));
+        let mut rec = Reconciler::with_snapshot(SnapshotStore::new(dir.join("state.json")));
         rec.restore().await.expect("empty snapshot restores");
         rec.reconcile(request(11, &[("a", spec.clone())])).await.unwrap();
         assert_eq!(rec.active_generation(), Some(11));
@@ -152,11 +83,11 @@ async fn a_restarted_process_restores_its_snapshot() {
         rec.shutdown().await;
     }
 
-    assert!(dir.file().exists(), "the snapshot was written");
+    assert!(dir.join("state.json").exists(), "the snapshot was written");
     assert!(TcpListener::bind(a).await.is_ok(), "the old listener is gone");
 
     // second process: restore
-    let mut rec = Reconciler::<TestSpec>::with_snapshot(SnapshotStore::new(dir.file()));
+    let mut rec = Reconciler::<TestSpec>::with_snapshot(SnapshotStore::new(dir.join("state.json")));
     let outcome = rec.restore().await.expect("snapshot restores");
 
     assert_eq!(outcome.generation, Some(11));
@@ -181,7 +112,7 @@ async fn submissions_before_the_restore_are_not_ready() {
         remote: echo,
     };
 
-    let mut rec = Reconciler::with_snapshot(SnapshotStore::new(dir.file()));
+    let mut rec = Reconciler::with_snapshot(SnapshotStore::new(dir.join("state.json")));
 
     let err = rec
         .reconcile(request(1, &[("a", spec.clone())]))
@@ -207,7 +138,7 @@ async fn a_partial_restore_marks_the_failed_endpoint_only() {
     let (good, blocked) = (free_addr(), free_addr());
 
     {
-        let mut rec = Reconciler::with_snapshot(SnapshotStore::new(dir.file()));
+        let mut rec = Reconciler::with_snapshot(SnapshotStore::new(dir.join("state.json")));
         rec.restore().await.unwrap();
         rec.reconcile(request(
             5,
@@ -236,7 +167,7 @@ async fn a_partial_restore_marks_the_failed_endpoint_only() {
     // somebody else took the address while realm was down
     let _squatter = TcpListener::bind(blocked).await.unwrap();
 
-    let mut rec = Reconciler::<TestSpec>::with_snapshot(SnapshotStore::new(dir.file()));
+    let mut rec = Reconciler::<TestSpec>::with_snapshot(SnapshotStore::new(dir.join("state.json")));
     let outcome = rec.restore().await.expect("a partial restore is not an error");
 
     assert_eq!(outcome.generation, Some(5));
@@ -256,7 +187,7 @@ async fn a_partial_restore_marks_the_failed_endpoint_only() {
 #[test]
 fn a_leftover_temporary_file_does_not_shadow_the_snapshot() {
     let dir = TempDir::new("atomic");
-    let store = SnapshotStore::new(dir.file());
+    let store = SnapshotStore::new(dir.join("state.json"));
 
     let snapshot = Snapshot {
         generation: 3,
@@ -274,7 +205,7 @@ fn a_leftover_temporary_file_does_not_shadow_the_snapshot() {
     store.store(&snapshot).expect("snapshot is written");
 
     // a crash mid-write leaves a temporary file behind
-    let leftover = dir.file().with_extension("json.tmp");
+    let leftover = dir.join("state.json").with_extension("json.tmp");
     std::fs::write(&leftover, b"{ truncated").unwrap();
 
     let loaded: Snapshot<TestSpec> = store
@@ -289,9 +220,9 @@ fn a_leftover_temporary_file_does_not_shadow_the_snapshot() {
 #[test]
 fn a_corrupt_snapshot_is_an_error() {
     let dir = TempDir::new("corrupt");
-    std::fs::write(dir.file(), b"{ this is not a snapshot").unwrap();
+    std::fs::write(dir.join("state.json"), b"{ this is not a snapshot").unwrap();
 
-    let store = SnapshotStore::new(dir.file());
+    let store = SnapshotStore::new(dir.join("state.json"));
     let loaded = store.load::<TestSpec>();
     assert!(loaded.is_err(), "a corrupt snapshot must be reported");
 }
@@ -303,7 +234,7 @@ async fn the_snapshot_tracks_the_applied_state() {
     let echo = spawn_echo("v1:").await;
     let a = free_addr();
 
-    let mut rec = Reconciler::with_snapshot(SnapshotStore::new(dir.file()));
+    let mut rec = Reconciler::with_snapshot(SnapshotStore::new(dir.join("state.json")));
     rec.restore().await.unwrap();
 
     rec.reconcile(request(
@@ -319,7 +250,7 @@ async fn the_snapshot_tracks_the_applied_state() {
     .await
     .unwrap();
 
-    let store = SnapshotStore::new(dir.file());
+    let store = SnapshotStore::new(dir.join("state.json"));
     let loaded: Snapshot<TestSpec> = store.load().unwrap().unwrap();
     assert_eq!(loaded.generation, 1);
     assert_eq!(loaded.endpoints.len(), 1);

@@ -15,33 +15,18 @@ use realm_core::endpoint::{RemoteAddr, TcpRuntime};
 use realm_core::lifecycle::{CancellationToken, Cohort};
 use realm_core::tcp::{bind_tcp, serve_tcp};
 
-/// An echo server that keeps answering until the test drops it.
-async fn spawn_echo() -> std::net::SocketAddr {
-    let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = lis.local_addr().unwrap();
+mod common;
+use common::spawn_echo;
 
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = lis.accept().await else {
-                return;
-            };
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 64];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => {
-                            if stream.write_all(&buf[..n]).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-
-    addr
+/// Send a payload and read the echo back, asserting it round-tripped intact.
+async fn roundtrip(stream: &mut TcpStream, payload: &[u8]) {
+    stream.write_all(payload).await.unwrap();
+    let mut buf = vec![0u8; payload.len()];
+    timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        .await
+        .expect("relay must answer in time")
+        .expect("relay must stay readable");
+    assert_eq!(&buf, payload);
 }
 
 fn runtime_for(remote: std::net::SocketAddr) -> Arc<TcpRuntime> {
@@ -52,21 +37,11 @@ fn runtime_for(remote: std::net::SocketAddr) -> Arc<TcpRuntime> {
     })
 }
 
-async fn roundtrip(stream: &mut TcpStream, payload: &[u8]) {
-    stream.write_all(payload).await.unwrap();
-    let mut buf = vec![0u8; payload.len()];
-    timeout(Duration::from_secs(2), stream.read_exact(&mut buf))
-        .await
-        .expect("relay must answer in time")
-        .expect("relay must stay readable");
-    assert_eq!(&buf, payload);
-}
-
 /// Covers AE2 (core path): stopping the listener must not disturb the
 /// connections it already accepted.
 #[tokio::test]
 async fn established_connections_survive_stop_accept() {
-    let echo = spawn_echo().await;
+    let echo = spawn_echo("").await;
 
     let lis = bind_tcp(&"127.0.0.1:0".parse().unwrap(), Default::default()).unwrap();
     let laddr = lis.local_addr().unwrap();
@@ -100,7 +75,7 @@ async fn established_connections_survive_stop_accept() {
 /// points, and the cohort only reports drained once they really exited.
 #[tokio::test]
 async fn cancelling_a_cohort_terminates_connections_and_zeroes_the_count() {
-    let echo = spawn_echo().await;
+    let echo = spawn_echo("").await;
 
     let lis = bind_tcp(&"127.0.0.1:0".parse().unwrap(), Default::default()).unwrap();
     let laddr = lis.local_addr().unwrap();
@@ -149,7 +124,7 @@ async fn bind_failure_is_reported_as_an_error() {
 /// Covers R15: an unused drain deadline finishes as soon as connections end.
 #[tokio::test]
 async fn drain_with_deadline_forces_remaining_connections() {
-    let echo = spawn_echo().await;
+    let echo = spawn_echo("").await;
 
     let lis = bind_tcp(&"127.0.0.1:0".parse().unwrap(), Default::default()).unwrap();
     let laddr = lis.local_addr().unwrap();

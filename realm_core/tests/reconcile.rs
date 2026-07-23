@@ -6,18 +6,18 @@
 //! duplicate endpoints nor disturb traffic a second time.
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::timeout;
 
 use realm_core::endpoint::{Endpoint, RemoteAddr};
 use realm_core::lifecycle::{
     DesiredEndpoint, EndpointSource, EndpointSpec, GenerationState, Proto, ReconcileError, ReconcileRequest,
     Reconciler, SlotAction, derive_id,
 };
+
+mod common;
+use common::{ask, free_addr, spawn_echo};
 
 /// Minimal stand-in for the top-level `EndpointConf`: the reconciler only
 /// needs to compare specs and turn them into lifecycle specs.
@@ -60,53 +60,6 @@ impl EndpointSource for TestSpec {
             drain: None,
         })
     }
-}
-
-async fn spawn_echo(tag: &'static str) -> SocketAddr {
-    let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = lis.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = lis.accept().await else {
-                return;
-            };
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 64];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => {
-                            let mut answer = Vec::from(tag.as_bytes());
-                            answer.extend_from_slice(&buf[..n]);
-                            if stream.write_all(&answer).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-
-    addr
-}
-
-fn free_addr() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-}
-
-async fn ask(stream: &mut TcpStream, payload: &[u8]) -> String {
-    stream.write_all(payload).await.unwrap();
-    let mut buf = vec![0u8; 128];
-    let n = timeout(Duration::from_secs(2), stream.read(&mut buf))
-        .await
-        .expect("relay must answer in time")
-        .expect("relay must stay readable");
-    String::from_utf8_lossy(&buf[..n]).into_owned()
 }
 
 fn request(generation: u64, endpoints: &[(&str, TestSpec)]) -> ReconcileRequest<TestSpec> {

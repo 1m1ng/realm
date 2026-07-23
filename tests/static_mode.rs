@@ -148,8 +148,8 @@ fn static_mode_reads_a_config_file() {
     assert_eq!(ask(&mut stream, b"ping"), "v1:ping");
 }
 
-/// `--version` advertises the control feature, so a deployment can tell which
-/// binary it is running (R22).
+/// `--version` says whether this binary has a control plane, so a deployment
+/// can tell which one it is running (R22, KTD7).
 #[test]
 fn version_advertises_the_control_feature() {
     let out = Command::new(env!("CARGO_BIN_EXE_realm"))
@@ -159,7 +159,16 @@ fn version_advertises_the_control_feature() {
         .expect("realm runs");
 
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("[control]"), "features should list control: {}", text);
+
+    if cfg!(feature = "control") {
+        assert!(text.contains("[control]"), "features should list control: {}", text);
+    } else {
+        assert!(
+            !text.contains("[control]"),
+            "a build without the feature must not advertise it: {}",
+            text
+        );
+    }
 }
 
 // The remaining tests need the control plane.
@@ -313,6 +322,101 @@ mod control {
         assert_eq!(status["active_generation"], 7, "the snapshot's generation is restored");
         assert_eq!(status["endpoints"][0]["id"], "agent-rule");
         assert!(status["ready"].as_bool().unwrap());
+    }
+
+    /// Covers R20: killing the process while it is applying generations never
+    /// leaves a state file that cannot be read back, and never moves the
+    /// recorded generation backwards.
+    #[test]
+    fn the_state_file_survives_kill_nine() {
+        const ROUNDS: u64 = 8;
+
+        let dir = TempDir::new("kill9");
+        let echo = spawn_echo("v1:");
+        let socket = dir.join("realm.sock");
+        let state = dir.join("state.json");
+
+        let mut highest = 0u64;
+
+        for round in 1..=ROUNDS {
+            let laddr = free_addr();
+            let realm = realm(&[
+                "-l",
+                &free_addr().to_string(),
+                "-r",
+                &echo.to_string(),
+                "--control-socket",
+                socket.to_str().unwrap(),
+                "--state-file",
+                state.to_str().unwrap(),
+            ]);
+
+            let body = serde_json::to_vec(&serde_json::json!({
+                "generation": round,
+                "endpoints": [{ "id": "rule", "listen": laddr.to_string(), "remote": echo.to_string() }],
+            }))
+            .unwrap();
+
+            // fire the submission and kill without waiting for the answer, so
+            // that SIGKILL lands somewhere inside applying and persisting it
+            let sent = send_without_reading(&socket, &body);
+            drop(realm);
+
+            let Ok(data) = std::fs::read(&state) else {
+                assert!(!sent, "a submitted generation must leave a readable state file");
+                continue;
+            };
+
+            let parsed: serde_json::Value = serde_json::from_slice(&data)
+                .unwrap_or_else(|e| panic!("round {}: the state file is corrupt ({}): {:?}", round, e, data));
+
+            let generation = parsed["generation"].as_u64().expect("the state file has a generation");
+            assert!(
+                generation >= highest,
+                "round {}: the recorded generation went backwards: {} < {}",
+                round,
+                generation,
+                highest
+            );
+            highest = generation;
+        }
+
+        // whatever survived must still be restorable
+        if highest > 0 {
+            let _realm = realm(&[
+                "-l",
+                &free_addr().to_string(),
+                "-r",
+                &echo.to_string(),
+                "--control-socket",
+                socket.to_str().unwrap(),
+                "--state-file",
+                state.to_str().unwrap(),
+            ]);
+
+            let (code, status) = call(&socket, "GET", "/v1/status", None);
+            assert_eq!(code, 200);
+            assert_eq!(status["active_generation"], highest, "the last state is restored");
+        }
+    }
+
+    /// Submit a request and walk away without reading the answer.
+    fn send_without_reading(socket: &std::path::Path, body: &[u8]) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            match UnixStream::connect(socket) {
+                Ok(x) => break x,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => return false,
+            }
+        };
+
+        let head = format!(
+            "PUT /v1/desired-state HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+
+        stream.write_all(head.as_bytes()).is_ok() && stream.write_all(body).is_ok() && stream.flush().is_ok()
     }
 
     /// Covers R21/R9: an endpoint that cannot bind never takes the process (or

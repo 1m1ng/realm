@@ -167,8 +167,9 @@ async fn version_reports_the_contract_and_capabilities() {
     assert_eq!(same["schema_version"], body["schema_version"]);
 }
 
-/// Covers R6/R11/R36: a desired state applied over the socket really forwards,
-/// and the status shows live connections and draining cohorts.
+/// Covers AE14 over http (R6, R11, R36): a desired state applied over the
+/// socket really forwards, and the status shows live connections and the
+/// draining cohort a replacement leaves behind.
 #[tokio::test]
 async fn a_desired_state_applies_and_shows_up_in_the_status() {
     let dir = TempDir::new("apply");

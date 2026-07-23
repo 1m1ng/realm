@@ -36,7 +36,17 @@ jobs:
 
       - name: clippy
         run: cargo clippy
-      - name: test core
+
+      # realm_core has no default features, so every combination has to be
+      # spelled out: testing only one of them silently skips the others
+      - name: test core (proxy)
         run: cargo test -p realm_core --no-fail-fast --features proxy
+      - name: test core (proxy, balance, multi-thread)
+        run: cargo test -p realm_core --no-fail-fast --features proxy,balance,multi-thread
+
       - name: test binary
         run: cargo test --no-fail-fast
+      # the control plane must stay optional: without it the binary is a
+      # plain upstream-compatible cli
+      - name: test binary (no control plane)
+        run: cargo test --no-fail-fast --no-default-features --features default-slim

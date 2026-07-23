@@ -8,44 +8,15 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use realm_core::endpoint::{Endpoint, RemoteAddr};
 use realm_core::lifecycle::{DrainPolicy, EndpointManager, EndpointSpec, Proto, SlotAction, SlotState};
 
-/// An echo server tagging its answers, so a connection can be told which
-/// generation of the configuration it is talking to.
-async fn spawn_echo(tag: &'static str) -> SocketAddr {
-    let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = lis.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = lis.accept().await else {
-                return;
-            };
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 64];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => {
-                            let mut answer = Vec::from(tag.as_bytes());
-                            answer.extend_from_slice(&buf[..n]);
-                            if stream.write_all(&answer).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-
-    addr
-}
+mod common;
+use common::{ask, free_addr, spawn_echo};
 
 fn spec(laddr: SocketAddr, remote: SocketAddr) -> EndpointSpec {
     EndpointSpec {
@@ -60,21 +31,6 @@ fn spec(laddr: SocketAddr, remote: SocketAddr) -> EndpointSpec {
         udp: false,
         drain: None,
     }
-}
-
-fn free_addr() -> SocketAddr {
-    let lis = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    lis.local_addr().unwrap()
-}
-
-async fn ask(stream: &mut TcpStream, payload: &[u8]) -> String {
-    stream.write_all(payload).await.unwrap();
-    let mut buf = vec![0u8; 128];
-    let n = timeout(Duration::from_secs(2), stream.read(&mut buf))
-        .await
-        .expect("relay must answer in time")
-        .expect("relay must stay readable");
-    String::from_utf8_lossy(&buf[..n]).into_owned()
 }
 
 fn slot(mgr: &mut EndpointManager, id: &str, proto: Proto) -> realm_core::lifecycle::SlotStatus {
@@ -147,7 +103,7 @@ async fn failed_bind_restores_the_previous_listener() {
     assert_eq!(ask(&mut established, b"three").await, "v1:three");
 }
 
-/// Covers AE2/AE14: replacing an endpoint on the same address keeps the
+/// Covers AE2, AE14: replacing an endpoint on the same address keeps the
 /// established connections on the old generation, visible as a draining cohort.
 #[tokio::test]
 async fn same_address_replacement_drains_the_old_generation() {
