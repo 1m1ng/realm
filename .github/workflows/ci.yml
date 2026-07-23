@@ -37,12 +37,27 @@ jobs:
       - name: clippy
         run: cargo clippy
 
-      # realm_core has no default features, so every combination has to be
-      # spelled out: testing only one of them silently skips the others
+      # realm_core has no default features, so a feature set that is not
+      # named below is simply not tested. Be honest about the split:
+      #   * the clippy job above cross-compiles + lints all 7 targets, but
+      #     only with realm_core's DEFAULT (empty) feature set -- it does
+      #     NOT compile-check proxy/balance/multi-thread/batched-udp/etc.
+      #   * the steps below actually run the tests, on the runner's HOST
+      #     target only (no `--target`): cross-target test execution is not
+      #     done here (aarch64/musl rows still run host-arch tests).
+      # Feature sets exercised below: proxy; proxy,balance,multi-thread;
+      # and proxy,balance,multi-thread,batched-udp -- the last so the
+      # lifecycle/udp tests actually run under batched-udp, where the risk
+      # lives. `transport` (and its tls-* variants) and `hook` are NOT
+      # test-run here: transport pulls kaminari+rcgen, which needs system
+      # deps beyond the toolchain action, so it is deliberately left out
+      # rather than claim coverage the workflow does not provide.
       - name: test core (proxy)
         run: cargo test -p realm_core --no-fail-fast --features proxy
       - name: test core (proxy, balance, multi-thread)
         run: cargo test -p realm_core --no-fail-fast --features proxy,balance,multi-thread
+      - name: test core (proxy, balance, multi-thread, batched-udp)
+        run: cargo test -p realm_core --no-fail-fast --features proxy,balance,multi-thread,batched-udp
 
       - name: test binary
         run: cargo test --no-fail-fast
