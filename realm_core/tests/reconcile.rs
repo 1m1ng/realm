@@ -654,6 +654,12 @@ async fn a_delete_keeps_its_force_close_deadline_when_its_address_is_taken_over(
 /// permanently strand a listener that was serving. The side whose address was
 /// released for the handoff is put back on its original address once the taker
 /// fails, and the taker keeps its own old listener (R27).
+///
+/// Unix-only: it drives one side to a bind failure and relies on that failure
+/// being observed, which depends on the platform's bind-conflict semantics
+/// (Windows permits or differently reports a conflicting bind). The feature
+/// ships on unix, so unix is the platform under test.
+#[cfg(unix)]
 #[tokio::test]
 async fn an_address_swap_with_a_bind_invalid_side_never_strands_a_listener() {
     let echo_a = spawn_echo("a1:").await;

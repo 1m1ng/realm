@@ -194,6 +194,13 @@ async fn delete_releases_the_port_and_forces_the_drain_deadline() {
 }
 
 /// Covers R23: the two protocols of one rule succeed or fail independently.
+///
+/// Unix-only: it forces the udp side to fail by pre-binding its port, which
+/// relies on the bind-conflict semantics of the target platform. On Windows a
+/// conflicting udp bind is permitted (SO_REUSEADDR) or returns PermissionDenied,
+/// so the "one side failed" premise does not hold. The hot-reload feature ships
+/// on unix (the control plane is unix-only), so unix is the platform under test.
+#[cfg(unix)]
 #[tokio::test]
 async fn protocols_of_one_rule_are_tracked_independently() {
     let echo = spawn_echo("v1:").await;
@@ -263,6 +270,11 @@ async fn a_spec_with_no_protocol_is_reported_failed_not_silently_applied() {
 /// #22: a same-address udp replacement while an association is alive. The old
 /// listener is replaced, the manager reports it updated, and a fresh datagram
 /// reaches the new remote.
+///
+/// Unix-only: the release-then-rebind on the same udp address depends on the
+/// platform's bind semantics (on Windows SO_REUSEADDR changes what a same-port
+/// rebind observes). The feature ships on unix, so unix is the platform tested.
+#[cfg(unix)]
 #[tokio::test]
 async fn same_address_udp_replacement_reaches_the_new_remote() {
     let echo1 = spawn_udp_echo("v1:").await;

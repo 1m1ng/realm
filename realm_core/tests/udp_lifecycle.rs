@@ -120,5 +120,15 @@ async fn bind_failure_is_reported_as_an_error() {
     let addr = occupied.local_addr().unwrap();
 
     let err = bind_udp(&addr, Default::default()).expect_err("port is taken");
-    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    // Unix reports AddrInUse; Windows reports PermissionDenied (WSAEACCES) for a
+    // conflicting bind. What matters for R10 is that the failure is reported as
+    // an error, not raised as a panic.
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+        ),
+        "unexpected bind error kind: {:?}",
+        err.kind()
+    );
 }
