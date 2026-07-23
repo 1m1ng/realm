@@ -266,9 +266,12 @@ impl EndpointManager {
         self.entries.keys().cloned().collect()
     }
 
-    /// Whether an id is currently managed.
-    pub fn contains(&self, id: &str) -> bool {
-        self.entries.contains_key(id)
+    /// Drain policy in effect for `id`, if the manager holds it.
+    ///
+    /// Lets the reconciler pick the right force-close deadline when it releases
+    /// an address for a contended handoff (R15, R27).
+    pub fn drain_policy(&self, id: &str) -> Option<DrainPolicy> {
+        self.entries.get(id).map(|e| e.drain)
     }
 
     /// Endpoint currently serving under `id`, per protocol.
@@ -285,8 +288,14 @@ impl EndpointManager {
         self.refresh();
 
         if let Err(e) = self.validate(&spec) {
-            return spec
-                .protos()
+            // a spec that enables neither protocol has no protos to report
+            // under; still emit one outcome so the generation is seen as
+            // partially applied instead of silently succeeding (R23).
+            let mut protos = spec.protos();
+            if protos.is_empty() {
+                protos.push(Proto::Tcp);
+            }
+            return protos
                 .into_iter()
                 .map(|proto| SlotOutcome::rejected(proto, e.clone()))
                 .collect();
@@ -341,15 +350,17 @@ impl EndpointManager {
     /// Stop accepting on one slot without removing it (R3).
     ///
     /// The listener socket is released; the connections it accepted keep
-    /// running until they end or the caller drains them.
-    pub async fn stop_accept(&mut self, id: &str, proto: Proto) -> Option<SlotOutcome> {
-        let drain = self.entries.get(id)?.drain;
+    /// running until they end or the drain `deadline` force-closes them. The
+    /// caller passes the deadline the operation calls for — the update policy
+    /// for an endpoint being replaced, the delete policy for one being removed
+    /// so a handoff cannot silently turn a delete into an indefinite drain.
+    pub async fn stop_accept(&mut self, id: &str, proto: Proto, deadline: Option<Duration>) -> Option<SlotOutcome> {
         let slot = self.entries.get_mut(id)?.slots.get_mut(&proto)?;
         let active = slot.active.take()?;
 
         let generation = active.generation;
         let cohort = stop_active(active).await;
-        slot.draining.push(spawn_drain(cohort, generation, drain.on_update));
+        slot.draining.push(spawn_drain(cohort, generation, deadline));
         slot.state = SlotState::Draining;
 
         Some(SlotOutcome::ok(proto, SlotAction::Draining))
@@ -407,14 +418,31 @@ impl EndpointManager {
 
     /// Reconcile the recorded state with reality: a serving task that exited on
     /// its own means the slot is not running, whatever it claimed before (R10).
+    ///
+    /// A task exiting on its own does not cancel the connections it already
+    /// spawned — neither the cohort nor the cancellation token cancels on drop.
+    /// So the cohort is pushed into the draining set under the delete deadline
+    /// before the slot is marked failed, exactly as an explicit stop would, so
+    /// those connections stay observable and are force-closed on schedule (R36).
     fn refresh(&mut self) {
         for entry in self.entries.values_mut() {
+            let delete_deadline = entry.drain.on_delete;
             for slot in entry.slots.values_mut() {
-                if let Some(active) = &slot.active {
-                    if active.task.is_finished() {
-                        slot.state = SlotState::Failed("serving task exited unexpectedly".into());
-                        slot.active = None;
-                    }
+                let exited = slot.active.as_ref().map(|a| a.task.is_finished()).unwrap_or(false);
+                if exited {
+                    let Active {
+                        generation,
+                        shutdown,
+                        cohort,
+                        task,
+                        ..
+                    } = slot.active.take().expect("just checked active is some");
+                    // the task already finished; cancel is a no-op and joining
+                    // would be immediate, so drop the handle rather than block
+                    shutdown.cancel();
+                    drop(task);
+                    slot.draining.push(spawn_drain(cohort, generation, delete_deadline));
+                    slot.state = SlotState::Failed("serving task exited unexpectedly".into());
                 }
 
                 slot.draining.retain(|d| !d.task.is_finished());
@@ -423,10 +451,14 @@ impl EndpointManager {
     }
 
     /// Drop slots that hold nothing anymore, and ids that hold no slot.
+    ///
+    /// A failed slot with nothing running is kept: it is still the desired
+    /// state and is healed by a later generation, or removed through the delete
+    /// path once the caller stops declaring it (R23, R25).
     fn prune(&mut self, id: &str) {
         if let Some(entry) = self.entries.get_mut(id) {
             entry.slots.retain(|_, slot| {
-                slot.active.is_some() || !slot.draining.is_empty() || slot.state != SlotState::Stopped
+                slot.active.is_some() || !slot.draining.is_empty() || matches!(slot.state, SlotState::Failed(_))
             });
 
             if entry.slots.is_empty() {
@@ -443,6 +475,19 @@ impl EndpointManager {
         proto: Proto,
         drain: DrainPolicy,
     ) -> SlotOutcome {
+        // no-op fast path: the proto is already serving this exact endpoint, so
+        // there is nothing to rebind. This is what makes a partial-failure
+        // resubmission leave the healthy sibling protocol completely untouched
+        // instead of stopping and rebinding it (R9, "endpoint unchanged ->
+        // untouched"). `Endpoint` has no `PartialEq` and its module is not ours
+        // to change, so its canonical `Display` — which renders every field
+        // that distinguishes one endpoint from another — is the comparison.
+        if let Some(slot) = self.entries.get(id).and_then(|e| e.slots.get(&proto)) {
+            if slot.active.is_some() && endpoint_unchanged(&slot.endpoint, &spec.endpoint) {
+                return SlotOutcome::ok(proto, SlotAction::Unchanged);
+            }
+        }
+
         let existing = self
             .entries
             .get_mut(id)
@@ -630,6 +675,15 @@ impl EndpointManager {
     }
 }
 
+/// Whether two endpoints are the same for the purpose of the no-op fast path.
+///
+/// `Endpoint` deliberately has no `PartialEq`, and its module is out of this
+/// change's scope, so equality is decided on its canonical `Display`, which
+/// spells out the listen address, every remote, and all bind/connect options.
+fn endpoint_unchanged(a: &Endpoint, b: &Endpoint) -> bool {
+    a.to_string() == b.to_string()
+}
+
 /// Bind and start serving one protocol of an endpoint.
 ///
 /// Returns only once the socket is bound, so a caller that gets `Ok` may
@@ -712,4 +766,91 @@ fn spawn_drain(mut cohort: Cohort, generation: Generation, deadline: Option<Dura
     });
 
     Draining { generation, stat, task }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    use crate::endpoint::RemoteAddr;
+
+    /// #4: a serving task that exits on its own leaves the connections it
+    /// already spawned running. `refresh` must hand that cohort to a draining
+    /// task — force-closed on the delete deadline — instead of dropping it and
+    /// orphaning the connections with no handle to observe or terminate them.
+    #[tokio::test]
+    async fn refresh_drains_the_cohort_of_a_serving_task_that_exited() {
+        let mut mgr = EndpointManager::new();
+
+        // a cohort with one live connection guard, as a real spawned relay holds
+        let cohort = Cohort::new();
+        let guard = cohort.handle().register();
+        assert_eq!(cohort.count(), 1);
+
+        let laddr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let endpoint = Endpoint {
+            laddr,
+            raddr: RemoteAddr::SocketAddr("127.0.0.1:9".parse().unwrap()),
+            bind_opts: Default::default(),
+            conn_opts: Default::default(),
+            extra_raddrs: Vec::new(),
+        };
+
+        let mut slots = BTreeMap::new();
+        slots.insert(
+            Proto::Tcp,
+            Slot {
+                state: SlotState::Running,
+                generation: 7,
+                endpoint,
+                // a serving task that has already returned on its own
+                active: Some(Active {
+                    generation: 7,
+                    laddr,
+                    shutdown: CancellationToken::new(),
+                    cohort,
+                    task: tokio::spawn(async { Ok(()) }),
+                }),
+                draining: Vec::new(),
+            },
+        );
+        mgr.entries.insert(
+            "a".into(),
+            Entry {
+                slots,
+                drain: DrainPolicy::default(),
+            },
+        );
+
+        // let the serving task actually finish before refresh looks at it
+        for _ in 0..1000 {
+            let finished = mgr.entries["a"].slots[&Proto::Tcp]
+                .active
+                .as_ref()
+                .map(|a| a.task.is_finished())
+                .unwrap_or(true);
+            if finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        mgr.refresh();
+
+        let slot = &mgr.entries["a"].slots[&Proto::Tcp];
+        assert!(slot.active.is_none(), "the exited task is cleared");
+        assert!(matches!(slot.state, SlotState::Failed(_)), "the slot is marked failed");
+        assert_eq!(
+            slot.draining.len(),
+            1,
+            "the cohort must be handed to a draining task, not dropped"
+        );
+        assert_eq!(slot.draining[0].generation, 7);
+        assert_eq!(
+            slot.draining[0].stat.count(),
+            1,
+            "the live connection stays observable while draining"
+        );
+
+        drop(guard);
+    }
 }
