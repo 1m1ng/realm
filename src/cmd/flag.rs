@@ -143,6 +143,20 @@ pub fn add_global_options(app: Command) -> Command {
             .display_order(2),
     ]);
 
+    // control plane
+    let app = app.next_help_heading("CONTROL OPTIONS").args([
+        Arg::new("control_socket")
+            .long("control-socket")
+            .help("serve the reconcile api on this unix socket")
+            .value_name("path")
+            .display_order(0),
+        Arg::new("state_file")
+            .long("state-file")
+            .help("where to keep the last-known-good state (default: alongside the control socket)")
+            .value_name("path")
+            .display_order(1),
+    ]);
+
     // log
     let app = app.next_help_heading("LOG OPTIONS").args(&[
         Arg::new("log_level")

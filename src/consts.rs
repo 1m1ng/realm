@@ -30,6 +30,8 @@ def_feat!(FEATURE_PROXY, "proxy");
 def_feat!(FEATURE_BALANCE, "balance");
 def_feat!(FEATURE_TRANSPORT, "transport");
 
+def_feat!(FEATURE_CONTROL, "control");
+
 def_feat!(FEATURE_MULTI_THREAD, "multi-thread");
 def_feat!(FEATURE_MIMALLOC, "mimalloc");
 def_feat!(FEATURE_JEMALLOC, "jemalloc");
@@ -42,6 +44,7 @@ pub struct Features {
     pub proxy: bool,
     pub balance: bool,
     pub transport: bool,
+    pub control: bool,
 
     pub multi_thread: bool,
     pub mimalloc: bool,
@@ -56,6 +59,7 @@ pub const FEATURES: Features = Features {
     proxy: FEATURE_PROXY,
     balance: FEATURE_BALANCE,
     transport: FEATURE_TRANSPORT,
+    control: FEATURE_CONTROL,
 
     multi_thread: FEATURE_MULTI_THREAD,
     mimalloc: FEATURE_MIMALLOC,
@@ -79,6 +83,7 @@ impl Display for Features {
         disp_feat!(proxy, "proxy");
         disp_feat!(balance, "balance");
         disp_feat!(transport, "transport");
+        disp_feat!(control, "control");
 
         disp_feat!(multi_thread, "multi-thread");
         disp_feat!(mimalloc, "mimalloc");
