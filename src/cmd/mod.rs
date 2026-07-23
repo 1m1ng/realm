@@ -113,6 +113,7 @@ fn handle_matches(matches: ArgMatches) -> CmdInput {
         // get
         if let Ok((soft, hard)) = get_nofile_limit() {
             println!("fd: soft={}, hard={}", soft, hard);
+            crate::process::amend(|s| s.nofile = Some((soft, hard)));
         }
     }
 
@@ -124,6 +125,7 @@ fn handle_matches(matches: ArgMatches) -> CmdInput {
             if let Ok(page) = page.parse::<usize>() {
                 set_pipe_size(page * 0x1000);
                 println!("pipe capacity: {}", page * 0x1000);
+                crate::process::amend(|s| s.pipe_page = Some(page));
             } else {
                 eprintln!("invalid page value: {}", page);
             }
@@ -136,6 +138,7 @@ fn handle_matches(matches: ArgMatches) -> CmdInput {
         if let Some(path) = matches.get_one::<String>("pre_conn_hook") {
             load_pre_conn(path);
             println!("hook: {}", path);
+            crate::process::amend(|s| s.pre_conn_hook = Some(path.clone()));
         }
     }
 

@@ -419,6 +419,46 @@ mod control {
         stream.write_all(head.as_bytes()).is_ok() && stream.write_all(body).is_ok() && stream.flush().is_ok()
     }
 
+    /// Covers R35: the status reports the process-wide settings realm was
+    /// started with, so an agent can detect drift in what it cannot change.
+    #[test]
+    fn status_reports_the_frozen_process_settings() {
+        let dir = TempDir::new("frozen");
+        let echo = spawn_echo("v1:");
+        let laddr = free_addr();
+        let socket = dir.join("realm.sock");
+
+        let _realm = realm(&[
+            "-l",
+            &laddr.to_string(),
+            "-r",
+            &echo.to_string(),
+            "--control-socket",
+            socket.to_str().unwrap(),
+            "--log-level",
+            "warn",
+            "--log-output",
+            "stderr",
+        ]);
+
+        wait_for_relay(laddr, "v1:");
+
+        let (code, status) = call(&socket, "GET", "/v1/status", None);
+        assert_eq!(code, 200);
+
+        let process = &status["process"];
+        assert_eq!(process["log_level"], "warn");
+        assert_eq!(process["log_output"], "stderr");
+        assert!(
+            process["nofile_soft"].as_u64().unwrap_or(0) > 0,
+            "the file descriptor limit in effect is reported: {}",
+            process
+        );
+        assert!(process["nofile_hard"].as_u64().unwrap_or(0) > 0);
+        assert!(process["dns"]["nameservers"].is_array());
+        assert!(process["features"].as_str().unwrap().contains("[control]"));
+    }
+
     /// Covers R21/R9: an endpoint that cannot bind never takes the process (or
     /// the other endpoints) down.
     #[test]

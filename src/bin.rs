@@ -101,6 +101,11 @@ fn start_from_conf(full: FullConf, control: ControlOpts) {
 fn setup_log(log: LogConf) {
     println!("log: {}", &log);
 
+    realm::process::amend(|s| {
+        s.log_level = Some(log.level.unwrap_or_default().to_string());
+        s.log_output = Some(log.output.clone().unwrap_or_else(|| String::from("stdout")));
+    });
+
     let (level, output) = log.build().unwrap_or_else(|e| fatal(e));
     fern::Dispatch::new()
         .format(|out, message, record| {

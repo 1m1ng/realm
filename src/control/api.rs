@@ -119,11 +119,26 @@ struct DrainingDto {
 }
 
 /// Process-wide settings an agent cannot change at runtime (R35).
+///
+/// Reported so that an agent can detect drift between what it believes a node
+/// was started with and what it is actually running.
 #[derive(Debug, Serialize)]
 struct ProcessDto {
     version: &'static str,
     features: String,
     dns: Option<DnsDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nofile_soft: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nofile_hard: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pipe_page: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pre_conn_hook: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -351,12 +366,20 @@ fn endpoint_status(status: EndpointStatus) -> EndpointStatusDto {
 }
 
 fn process_status() -> ProcessDto {
+    let settings = crate::process::effective();
+
     ProcessDto {
         version: VERSION,
         features: FEATURES.to_string(),
         dns: realm_core::dns::effective_conf().map(|conf| DnsDto {
             nameservers: conf.conf.name_servers().iter().map(|ns| ns.ip.to_string()).collect(),
         }),
+        log_level: settings.log_level,
+        log_output: settings.log_output,
+        nofile_soft: settings.nofile.map(|(soft, _)| soft),
+        nofile_hard: settings.nofile.map(|(_, hard)| hard),
+        pipe_page: settings.pipe_page,
+        pre_conn_hook: settings.pre_conn_hook,
     }
 }
 

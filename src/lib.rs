@@ -1,6 +1,7 @@
 pub mod cmd;
 pub mod conf;
 pub mod consts;
+pub mod process;
 
 #[cfg(all(unix, feature = "control"))]
 pub mod control;
