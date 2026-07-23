@@ -16,7 +16,7 @@ use realm_core::endpoint::{Endpoint, RemoteAddr};
 use realm_core::lifecycle::{DrainPolicy, EndpointManager, EndpointSpec, Proto, SlotAction, SlotState};
 
 mod common;
-use common::{ask, free_addr, spawn_echo};
+use common::{ask, ask_udp, free_addr, spawn_echo, spawn_udp_echo};
 
 fn spec(laddr: SocketAddr, remote: SocketAddr) -> EndpointSpec {
     EndpointSpec {
@@ -230,4 +230,75 @@ async fn validation_has_no_side_effect() {
     // nothing was bound by validating
     let lis = TcpListener::bind(laddr).await;
     assert!(lis.is_ok(), "validation must not bind anything");
+}
+
+/// #15: a spec that enables neither protocol is rejected by validation, which
+/// has no protocol to report under — it must still produce an outcome so the
+/// generation is seen as failed instead of silently applied.
+#[tokio::test]
+async fn a_spec_with_no_protocol_is_reported_failed_not_silently_applied() {
+    let echo = spawn_echo("v1:").await;
+    let laddr = free_addr();
+
+    let mut mgr = EndpointManager::new();
+    let mut s = spec(laddr, echo);
+    s.tcp = false;
+    s.udp = false;
+
+    let outcome = mgr.apply("a".into(), 1, s).await;
+    assert!(!outcome.is_empty(), "a rejected spec must still produce an outcome");
+    assert!(
+        outcome.iter().all(|o| o.action == SlotAction::Failed),
+        "every reported protocol is failed: {:?}",
+        outcome
+    );
+    assert_eq!(
+        outcome[0].retryable,
+        Some(false),
+        "a spec realm cannot make sense of is terminal"
+    );
+    assert!(outcome[0].error.as_deref().unwrap_or_default().contains("neither"));
+}
+
+/// #22: a same-address udp replacement while an association is alive. The old
+/// listener is replaced, the manager reports it updated, and a fresh datagram
+/// reaches the new remote.
+#[tokio::test]
+async fn same_address_udp_replacement_reaches_the_new_remote() {
+    let echo1 = spawn_udp_echo("v1:").await;
+    let echo2 = spawn_udp_echo("v2:").await;
+    let laddr = free_addr();
+
+    let mut mgr = EndpointManager::new();
+    let mut s = spec(laddr, echo1);
+    s.tcp = false;
+    s.udp = true;
+    let outcome = mgr.apply("a".into(), 1, s).await;
+    assert_eq!(outcome.len(), 1);
+    assert_eq!(outcome[0].proto, Proto::Udp);
+    assert_eq!(outcome[0].action, SlotAction::Created);
+
+    // establish an association through the udp endpoint
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    assert_eq!(ask_udp(&client, laddr, b"x").await, "v1:x");
+
+    // replace on the same address with a different remote
+    let mut s2 = spec(laddr, echo2);
+    s2.tcp = false;
+    s2.udp = true;
+    let outcome = mgr.apply("a".into(), 2, s2).await;
+    assert_eq!(
+        outcome[0].action,
+        SlotAction::Updated,
+        "a same-address udp change is a replacement: {:?}",
+        outcome
+    );
+
+    let status = slot(&mut mgr, "a", Proto::Udp);
+    assert_eq!(status.state, SlotState::Running);
+    assert_eq!(status.generation, 2);
+
+    // a fresh association reaches the new remote
+    let fresh = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    assert_eq!(ask_udp(&fresh, laddr, b"z").await, "v2:z");
 }

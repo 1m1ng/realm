@@ -17,9 +17,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 
+use futures::FutureExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, oneshot};
@@ -156,6 +159,10 @@ pub struct Reconciler<S: EndpointSource> {
     active: Option<Generation>,
     /// response of the active generation, replayed for idempotent retries (R8)
     last: Option<ReconcileResponse>,
+    /// content digest of the active generation's request, so a same-generation
+    /// resubmission with *different* content is caught instead of being handed
+    /// the first payload's success (R8)
+    last_digest: Option<u64>,
     /// whether the active generation is only partially applied (R25, R34)
     partial: bool,
     /// false until a snapshot restore has finished (R33)
@@ -177,6 +184,7 @@ impl<S: EndpointSource> Reconciler<S> {
             applied: BTreeMap::new(),
             active: None,
             last: None,
+            last_digest: None,
             partial: false,
             ready: true,
             snapshot: None,
@@ -247,6 +255,7 @@ impl<S: EndpointSource> Reconciler<S> {
         }
 
         let generation = request.generation;
+        let digest = digest_of(&request.endpoints);
 
         if let Some(active) = self.active {
             if generation < active {
@@ -259,11 +268,25 @@ impl<S: EndpointSource> Reconciler<S> {
             }
 
             // a repeated submission of the active generation replays the first
-            // answer: no duplicate endpoint, no second disturbance (R8, AE4)
+            // answer: no duplicate endpoint, no second disturbance (R8, AE4) —
+            // but only when the *content* matches. Two controllers reusing one
+            // generation for different desired states must not both be told the
+            // first one succeeded, so a same-generation content mismatch is a
+            // terminal conflict rather than a false replay.
             if generation == active {
-                if let Some(last) = &self.last {
-                    log::debug!("[reconcile]replaying generation {}", generation);
-                    return Ok(last.clone());
+                match &self.last {
+                    Some(last) if self.last_digest == Some(digest) => {
+                        log::debug!("[reconcile]replaying generation {}", generation);
+                        return Ok(last.clone());
+                    }
+                    Some(_) => {
+                        log::warn!(
+                            "[reconcile]generation {} resubmitted with different content, refusing",
+                            generation
+                        );
+                        return Err(ReconcileError::Stale { active });
+                    }
+                    None => {}
                 }
             }
         }
@@ -280,6 +303,7 @@ impl<S: EndpointSource> Reconciler<S> {
         self.active = Some(generation);
         self.partial = response.state == GenerationState::PartiallyApplied;
         self.last = Some(response.clone());
+        self.last_digest = Some(digest);
         self.persist();
         Ok(response)
     }
@@ -333,7 +357,8 @@ impl<S: EndpointSource> Reconciler<S> {
         };
 
         for (id, spec) in snapshot.endpoints {
-            let built = match spec.build() {
+            // build off the reconciler task: it may resolve dns, which blocks
+            let built = match build_offloaded(&spec).await {
                 Ok(x) => x,
                 Err(e) => {
                     log::error!("[reconcile]cannot restore {}: {}", id, e);
@@ -402,7 +427,11 @@ impl<S: EndpointSource> Reconciler<S> {
                 continue;
             }
 
-            match spec.build() {
+            // build off the reconciler task: `build` may resolve dns, which
+            // blocks the single serial consumer that also answers status and
+            // readiness. A join failure (including a build panic) is a failed
+            // endpoint, not a dead reconciler.
+            match build_offloaded(&spec).await {
                 Ok(built) => {
                     desired.insert(id.clone(), spec.clone());
                     let plan = match self.applied.get(&id) {
@@ -419,17 +448,21 @@ impl<S: EndpointSource> Reconciler<S> {
         }
 
         // ---- cross-endpoint validation: duplicate listen + protocol (R28) --
-        mark_duplicates(&mut plans);
+        // an endpoint left unchanged is still listening, so it counts against a
+        // new endpoint trying to take its address just like a fresh collision.
+        let incumbents = self.unchanged_incumbents(&plans);
+        mark_duplicates(&mut plans, &incumbents);
 
-        // ---- removals: everything applied but no longer desired ------------
-        for id in self.applied.keys() {
-            if !plans.contains_key(id) {
-                plans.insert(id.clone(), Plan::Delete);
-            }
+        // ---- removals: every id the manager still holds that nothing desires -
+        // deriving the deletion set from what the manager actually serves — not
+        // from `self.applied` — means an endpoint whose failed replace kept its
+        // old listener still gets deleted when a later generation drops it (#5).
+        for id in self.manager.ids() {
+            plans.entry(id).or_insert(Plan::Delete);
         }
 
         // ---- ordering: free the addresses somebody else needs first (R27) --
-        self.release_contended_addresses(&plans).await;
+        let released = self.release_contended_addresses(&plans).await;
 
         // ---- application ---------------------------------------------------
         let mut results = Vec::new();
@@ -454,7 +487,14 @@ impl<S: EndpointSource> Reconciler<S> {
                     // it is reported once, under tcp.
                     let protos = self.protos_of(&id);
                     let protos = if protos.is_empty() { vec![Proto::Tcp] } else { protos };
-                    desired.remove(&id);
+                    // keep the previous applied spec: an invalid resubmission of
+                    // an endpoint that is still serving must not drop it from the
+                    // applied set, or a later deletion would never reach it.
+                    if !self.manager.ids().contains(&id) {
+                        desired.remove(&id);
+                    } else if let Some(prev) = self.applied.get(&id) {
+                        desired.insert(id.clone(), prev.clone());
+                    }
                     for proto in protos {
                         results.push(EndpointResult {
                             id: id.clone(),
@@ -468,14 +508,35 @@ impl<S: EndpointSource> Reconciler<S> {
                     }
                 }
                 Plan::Start { built } | Plan::Replace { built } => {
+                    let previous_spec = self.applied.get(&id).cloned();
                     let outcomes = self.manager.apply(id.clone(), generation, built).await;
-                    if outcomes.iter().any(|o| o.action == SlotAction::Failed) {
-                        // a failed slot is not part of the applied state, so a
-                        // later generation retries it instead of seeing it as
-                        // unchanged (R25)
-                        desired.remove(&id);
-                    }
+                    let failed = outcomes.iter().any(|o| o.action == SlotAction::Failed);
                     results.extend(into_results(&id, outcomes));
+
+                    if failed {
+                        // this endpoint's address may have been released for a
+                        // contended handoff; if its replacement then failed, try
+                        // to put it back on its original address so a swap gone
+                        // wrong never strands a listener that was serving (#10,
+                        // R27).
+                        if released.contains(&id) && !self.serving(&id) {
+                            self.restore_released(&id, generation, previous_spec.as_ref(), &mut results)
+                                .await;
+                        }
+
+                        // keep the applied set matching what the manager really
+                        // serves: an id that kept its old listener stays applied
+                        // under its *previous* spec, one that is still partly up
+                        // keeps the new spec, one left with nothing is dropped so
+                        // a later generation retries it (#5, #9, R25).
+                        if self.serving(&id) {
+                            if let Some(prev) = previous_spec {
+                                desired.insert(id.clone(), prev);
+                            }
+                        } else {
+                            desired.remove(&id);
+                        }
+                    }
                 }
                 Plan::Delete => {
                     let outcomes = self.manager.remove(&id, generation).await;
@@ -528,13 +589,81 @@ impl<S: EndpointSource> Reconciler<S> {
             .collect()
     }
 
+    /// Whether any protocol of `id` is currently serving.
+    fn serving(&self, id: &str) -> bool {
+        [Proto::Tcp, Proto::Udp]
+            .into_iter()
+            .any(|p| self.manager.active_endpoint(id, p).is_some())
+    }
+
+    /// Listen addresses still held by endpoints this generation leaves
+    /// unchanged, so `mark_duplicates` can reject a new endpoint colliding with
+    /// a still-listening incumbent (R28). The incumbent carries no `built` spec
+    /// of its own for the duplicate check to see.
+    fn unchanged_incumbents(&self, plans: &BTreeMap<EndpointId, Plan>) -> BTreeMap<(SocketAddr, Proto), EndpointId> {
+        let mut incumbents = BTreeMap::new();
+        for (id, plan) in plans {
+            if matches!(plan, Plan::Unchanged) {
+                for proto in [Proto::Tcp, Proto::Udp] {
+                    if let Some(ep) = self.manager.active_endpoint(id, proto) {
+                        incumbents.insert((ep.laddr, proto), id.clone());
+                    }
+                }
+            }
+        }
+        incumbents
+    }
+
+    /// Put a released endpoint back on its original address after its move
+    /// failed.
+    ///
+    /// Best-effort: the original address is free only if the endpoint that was
+    /// going to take it also failed. When the restore succeeds the endpoint is
+    /// serving its previous configuration again; when it cannot, the earlier
+    /// failure already stands and nothing more is reported (#10, R27).
+    async fn restore_released(
+        &mut self,
+        id: &str,
+        generation: Generation,
+        previous: Option<&S>,
+        results: &mut [EndpointResult],
+    ) {
+        let Some(previous) = previous else {
+            return;
+        };
+        let Ok(built) = build_offloaded(previous).await else {
+            return;
+        };
+
+        let outcomes = self.manager.apply(id.to_string(), generation, built).await;
+        if outcomes.iter().any(|o| o.action == SlotAction::Failed) {
+            return;
+        }
+
+        log::warn!("[reconcile]{} could not move, restored its previous listener", id);
+        // the endpoint is serving its old configuration again: the recorded
+        // failure keeps its retryable classification, but the connections are
+        // no longer stranded.
+        let restored: BTreeSet<Proto> = outcomes.iter().map(|o| o.proto).collect();
+        for result in results.iter_mut() {
+            if result.id == id && restored.contains(&result.proto) && result.action == SlotAction::Failed {
+                result.error = Some(match result.error.take() {
+                    Some(e) => format!("{} (previous listener restored)", e),
+                    None => "move failed, previous listener restored".into(),
+                });
+            }
+        }
+    }
+
     /// Stop accepting on endpoints whose address another endpoint of this
     /// generation is about to take.
     ///
     /// Without this, swapping two addresses in one generation could not
     /// converge: each bind would hit the other's listener. Stopping is safe
     /// here because the connections keep running in their cohort.
-    async fn release_contended_addresses(&mut self, plans: &BTreeMap<EndpointId, Plan>) {
+    async fn release_contended_addresses(&mut self, plans: &BTreeMap<EndpointId, Plan>) -> BTreeSet<EndpointId> {
+        let mut released = BTreeSet::new();
+
         // addresses this generation wants to bind
         let mut wanted: BTreeSet<(SocketAddr, Proto)> = BTreeSet::new();
         for (id, plan) in plans {
@@ -555,21 +684,26 @@ impl<S: EndpointSource> Reconciler<S> {
         }
 
         if wanted.is_empty() {
-            return;
+            return released;
         }
 
-        // addresses this generation is going to release
-        let mut releasing: Vec<(EndpointId, Proto, SocketAddr)> = Vec::new();
+        // addresses this generation is going to release, and whether the
+        // endpoint holding each is being deleted (force-close on the delete
+        // deadline) or only replaced (drain under the update policy) (#23)
+        let mut releasing: Vec<(EndpointId, Proto, SocketAddr, bool)> = Vec::new();
         for (id, plan) in plans {
-            let leaving = match plan {
-                Plan::Delete => true,
-                Plan::Replace { built } => [Proto::Tcp, Proto::Udp].into_iter().any(|proto| {
-                    self.manager
-                        .active_endpoint(id, proto)
-                        .map(|e| e.laddr != built.endpoint.laddr || !built.protos().contains(&proto))
-                        .unwrap_or(false)
-                }),
-                _ => false,
+            let (leaving, deleting) = match plan {
+                Plan::Delete => (true, true),
+                Plan::Replace { built } => (
+                    [Proto::Tcp, Proto::Udp].into_iter().any(|proto| {
+                        self.manager
+                            .active_endpoint(id, proto)
+                            .map(|e| e.laddr != built.endpoint.laddr || !built.protos().contains(&proto))
+                            .unwrap_or(false)
+                    }),
+                    false,
+                ),
+                _ => (false, false),
             };
 
             if !leaving {
@@ -578,22 +712,34 @@ impl<S: EndpointSource> Reconciler<S> {
 
             for proto in [Proto::Tcp, Proto::Udp] {
                 if let Some(endpoint) = self.manager.active_endpoint(id, proto) {
-                    releasing.push((id.clone(), proto, endpoint.laddr));
+                    releasing.push((id.clone(), proto, endpoint.laddr, deleting));
                 }
             }
         }
 
-        for (id, proto, laddr) in releasing {
+        for (id, proto, laddr, deleting) in releasing {
             if wanted.contains(&(laddr, proto)) {
+                let policy = self.manager.drain_policy(&id).unwrap_or_default();
+                // a delete keeps its force-close deadline even when the address
+                // is taken over by another endpoint; a replace drains under the
+                // update policy as it would without contention (#23)
+                let deadline = if deleting { policy.on_delete } else { policy.on_update };
                 log::debug!(
                     "[reconcile]releasing {} on {}/{} for another endpoint",
                     id,
                     laddr,
                     proto
                 );
-                self.manager.stop_accept(&id, proto).await;
+                self.manager.stop_accept(&id, proto, deadline).await;
+                // a replaced endpoint whose address was handed off is a
+                // restore candidate if its own move then fails (#10)
+                if !deleting {
+                    released.insert(id);
+                }
             }
         }
+
+        released
     }
 
     /// Run this reconciler as the single consumer of a submission queue.
@@ -607,19 +753,38 @@ impl<S: EndpointSource> Reconciler<S> {
         tokio::spawn(async move {
             let mut this = self;
             while let Some(message) = rx.recv().await {
+                // A panic while handling one message must not take the whole
+                // reconciler down: the handle would then degrade to "reconciler
+                // is gone" forever, poisoning every future status and submission.
+                // Catch it, answer that one request, and keep serving (#6). The
+                // release profile unwinds, so this is sound.
                 match message {
                     Message::Reconcile(request, reply) => {
-                        let response = this.reconcile(request).await;
+                        let response = match AssertUnwindSafe(this.reconcile(request)).catch_unwind().await {
+                            Ok(response) => response,
+                            Err(_) => Err(ReconcileError::Internal(
+                                "reconciler panicked while handling the request".into(),
+                            )),
+                        };
                         let _ = reply.send(response);
                     }
                     Message::Status(reply) => {
-                        let _ = reply.send(this.status());
+                        let statuses = AssertUnwindSafe(async { this.status() })
+                            .catch_unwind()
+                            .await
+                            .unwrap_or_default();
+                        let _ = reply.send(statuses);
                     }
                     Message::Generation(reply) => {
-                        let _ = reply.send((this.active_generation(), this.is_partial(), this.is_ready()));
+                        let generation =
+                            AssertUnwindSafe(async { (this.active_generation(), this.is_partial(), this.is_ready()) })
+                                .catch_unwind()
+                                .await
+                                .unwrap_or((None, false, false));
+                        let _ = reply.send(generation);
                     }
                     Message::SetReady(ready, reply) => {
-                        this.set_ready(ready);
+                        let _ = AssertUnwindSafe(async { this.set_ready(ready) }).catch_unwind().await;
                         let _ = reply.send(());
                     }
                 }
@@ -643,9 +808,42 @@ fn into_results(id: &str, outcomes: Vec<SlotOutcome>) -> Vec<EndpointResult> {
         .collect()
 }
 
+/// Build a spec without blocking the reconciler task.
+///
+/// `EndpointSource::build` may resolve dns synchronously; running it on the
+/// serial consumer would stall status, readiness and every other submission.
+/// A join failure — a panic inside `build`, or a cancelled blocking pool —
+/// becomes a failed endpoint rather than a failed generation (#11, R31).
+async fn build_offloaded<S: EndpointSource>(spec: &S) -> Result<EndpointSpec, String> {
+    let spec = spec.clone();
+    match tokio::task::spawn_blocking(move || spec.build()).await {
+        Ok(result) => result,
+        Err(join) => Err(format!("building the endpoint failed: {}", join)),
+    }
+}
+
+/// Order-independent content digest of a submission.
+///
+/// Two submissions carrying the same generation but different desired states
+/// must be told apart, so a same-generation resubmission is only replayed when
+/// the content matches (R8).
+fn digest_of<S: EndpointSource>(endpoints: &[DesiredEndpoint<S>]) -> u64 {
+    let mut sorted: Vec<(&EndpointId, &S)> = endpoints.iter().map(|e| (&e.id, &e.spec)).collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    let bytes = serde_json::to_vec(&sorted).unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Fail every endpoint that shares a listen address and protocol with another
 /// endpoint of the same generation, deterministically and before any bind.
-fn mark_duplicates(plans: &mut BTreeMap<EndpointId, Plan>) {
+///
+/// `incumbents` carries the addresses of endpoints this generation leaves
+/// unchanged: they are still listening, so a newcomer colliding with one is
+/// just as terminal as two newcomers colliding, but only the newcomer fails —
+/// the incumbent is not disturbed (R28).
+fn mark_duplicates(plans: &mut BTreeMap<EndpointId, Plan>, incumbents: &BTreeMap<(SocketAddr, Proto), EndpointId>) {
     let mut seen: BTreeMap<(SocketAddr, Proto), Vec<EndpointId>> = BTreeMap::new();
 
     for (id, plan) in plans.iter() {
@@ -657,12 +855,20 @@ fn mark_duplicates(plans: &mut BTreeMap<EndpointId, Plan>) {
     }
 
     for ((laddr, proto), ids) in seen {
-        if ids.len() < 2 {
-            continue;
-        }
-        let error = format!("duplicate listen address {} for {} in one generation", laddr, proto);
-        for id in ids {
-            plans.insert(id, Plan::Invalid { error: error.clone() });
+        if ids.len() >= 2 {
+            let error = format!("duplicate listen address {} for {} in one generation", laddr, proto);
+            for id in ids {
+                plans.insert(id, Plan::Invalid { error: error.clone() });
+            }
+        } else if let Some(incumbent) = incumbents.get(&(laddr, proto)) {
+            let id = &ids[0];
+            if id != incumbent {
+                let error = format!(
+                    "duplicate listen address {} for {}: already served by endpoint `{}`",
+                    laddr, proto, incumbent
+                );
+                plans.insert(id.clone(), Plan::Invalid { error });
+            }
         }
     }
 }
