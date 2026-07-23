@@ -127,9 +127,9 @@ Answer, `200`:
 }
 ```
 
-- `state` — `validating`, `binding`, `running`, `draining`, `stopped`, `failed`.
-  A slot reports `running` only after its socket is bound; a serving task that
-  exits on its own turns the slot `failed` with an `error`.
+- `state` — `running`, `draining`, `stopped`, or `failed`. A slot reports
+  `running` only after its socket is bound; a serving task that exits on its own
+  turns the slot `failed` with an `error`.
 - `connections` — live connections (tcp) or associations (udp) on the current
   generation.
 - `draining` — one entry per superseded generation that still has traffic.

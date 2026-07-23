@@ -58,10 +58,6 @@ impl Display for Proto {
 /// State of one `(id, protocol)` slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotState {
-    /// being validated, nothing bound yet
-    Validating,
-    /// bind in progress
-    Binding,
     /// bound and serving
     Running,
     /// no longer accepting, existing connections still draining

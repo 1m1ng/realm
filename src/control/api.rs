@@ -460,8 +460,6 @@ fn action_str(action: SlotAction) -> &'static str {
 
 fn state_str(state: &SlotState) -> &'static str {
     match state {
-        SlotState::Validating => "validating",
-        SlotState::Binding => "binding",
         SlotState::Running => "running",
         SlotState::Draining => "draining",
         SlotState::Stopped => "stopped",
