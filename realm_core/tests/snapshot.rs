@@ -8,7 +8,6 @@
 use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
 use realm_core::endpoint::{Endpoint, RemoteAddr};
@@ -236,6 +235,108 @@ fn the_snapshot_is_owner_only() {
 
     let mode = std::fs::metadata(dir.join("state.json")).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "the snapshot must not be readable by others");
+}
+
+/// Finding #1: the temporary file must never be written through a pre-planted
+/// symlink. A local user who can create a name in the state directory must not
+/// be able to make realm clobber an arbitrary file with realm's (typically
+/// root) privileges.
+#[cfg(unix)]
+#[test]
+fn the_snapshot_temp_file_does_not_follow_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new("symlink");
+    let state = dir.join("state.json");
+    let store = SnapshotStore::new(state.clone());
+
+    // a file the attacker wants realm to overwrite for them
+    let victim = dir.join("victim");
+    std::fs::write(&victim, b"do not touch").unwrap();
+
+    // pre-plant the (old, fixed) temp name as a symlink to the victim
+    let planted = state.with_extension("json.tmp");
+    symlink(&victim, &planted).unwrap();
+
+    let snapshot = Snapshot::<TestSpec> {
+        generation: 7,
+        partial: false,
+        endpoints: [(
+            "a".to_string(),
+            TestSpec {
+                listen: "127.0.0.1:1".into(),
+                remote: "127.0.0.1:2".parse().unwrap(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    store.store(&snapshot).expect("the snapshot is written");
+
+    // the write must have gone to a fresh unique file, never through the
+    // planted symlink, so the victim is byte-for-byte untouched
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        b"do not touch",
+        "the snapshot must not be written through a pre-planted symlink",
+    );
+
+    // and the snapshot itself round-trips
+    let loaded: Snapshot<TestSpec> = store.load().unwrap().unwrap();
+    assert_eq!(loaded.generation, 7);
+    assert_eq!(loaded.endpoints.len(), 1);
+}
+
+/// Finding #1 (happy path): a plain store still round-trips through load with
+/// the hardened, unique-name temp file.
+#[test]
+fn a_plain_store_round_trips() {
+    let dir = TempDir::new("roundtrip");
+    let store = SnapshotStore::new(dir.join("state.json"));
+
+    let snapshot = Snapshot {
+        generation: 42,
+        partial: true,
+        endpoints: [(
+            "a".to_string(),
+            TestSpec {
+                listen: "127.0.0.1:1".into(),
+                remote: "127.0.0.1:2".parse().unwrap(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    store.store(&snapshot).expect("the snapshot is written");
+
+    let loaded: Snapshot<TestSpec> = store.load().unwrap().unwrap();
+    assert_eq!(loaded.generation, 42);
+    assert!(loaded.partial);
+    assert_eq!(loaded.endpoints.len(), 1);
+}
+
+/// Finding #7: the state directory must be created owner-only, never with the
+/// process umask (the daemon path sets umask(0), which would make the first
+/// persist create it world-writable).
+#[cfg(unix)]
+#[test]
+fn the_state_directory_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new("dirperms");
+    let sub = dir.join("state"); // does not exist yet
+    let store = SnapshotStore::new(sub.join("state.json"));
+
+    store
+        .store(&Snapshot::<TestSpec> {
+            generation: 1,
+            partial: false,
+            endpoints: Default::default(),
+        })
+        .unwrap();
+
+    let mode = std::fs::metadata(&sub).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "the state directory must not be writable by others");
 }
 
 /// A corrupt snapshot is reported, never a panic and never a silent wipe.

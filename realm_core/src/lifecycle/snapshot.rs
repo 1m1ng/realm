@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
@@ -55,11 +57,18 @@ struct EnvelopeRef<'a, S> {
 #[derive(Debug, Clone)]
 pub struct SnapshotStore {
     path: PathBuf,
+    /// Feeds the unique temp-file name so concurrent or repeated writes never
+    /// collide on a fixed, guessable path (finding #1). Shared across clones so
+    /// two handles to the same store cannot pick the same sequence number.
+    tmp_counter: Arc<AtomicU64>,
 }
 
 impl SnapshotStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            tmp_counter: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -99,7 +108,7 @@ impl SnapshotStore {
     /// Replace the snapshot atomically.
     pub fn store<S: Serialize>(&self, snapshot: &Snapshot<S>) -> io::Result<()> {
         let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(dir)?;
+        create_dir_owner_only(dir)?;
 
         let data = serde_json::to_vec_pretty(&EnvelopeRef {
             version: SNAPSHOT_VERSION,
@@ -107,11 +116,21 @@ impl SnapshotStore {
         })
         .map_err(|e| io::Error::other(format!("failed to serialize snapshot: {}", e)))?;
 
-        // same directory, so the rename stays within one filesystem
-        let tmp = self.path.with_extension("json.tmp");
-        {
+        // Write to a UNIQUE temp file in the same directory (so the rename
+        // stays within one filesystem), opened with `create_new` => `O_EXCL`.
+        // `O_EXCL` refuses to follow a symlink at the final component and fails
+        // if the path already exists, so the write can never land on a
+        // pre-existing file (finding #1). A fixed, guessable temp name let a
+        // local user pre-plant it as a symlink and have realm write straight
+        // through it with realm's (typically root) privileges.
+        let base_name = self.path.file_name().and_then(|n| n.to_str()).unwrap_or("snapshot");
+
+        let (tmp, mut file) = loop {
+            let seq = self.tmp_counter.fetch_add(1, Ordering::Relaxed);
+            let tmp = dir.join(format!("{}.{}.{}.tmp", base_name, std::process::id(), seq));
+
             let mut options = fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
+            options.write(true).create_new(true);
 
             // the snapshot spells out every forwarding rule, transport
             // parameters included: it is nobody else's business
@@ -121,12 +140,27 @@ impl SnapshotStore {
                 options.mode(0o600);
             }
 
-            let mut file = options.open(&tmp)?;
-            file.write_all(&data)?;
-            file.sync_all()?;
+            match options.open(&tmp) {
+                Ok(file) => break (tmp, file),
+                // the unique name was taken (a concurrent write, a rerun, or a
+                // squatter): pick the next one rather than touch what is there
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        };
+
+        // any failure after the temp file exists must not leave it behind
+        let written = file.write_all(&data).and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
         }
 
-        fs::rename(&tmp, &self.path)?;
+        if let Err(e) = fs::rename(&tmp, &self.path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
 
         // make the rename itself durable
         if let Ok(dir) = fs::File::open(dir) {
@@ -135,6 +169,22 @@ impl SnapshotStore {
 
         Ok(())
     }
+}
+
+/// Create the snapshot's directory owner-only, so its contents — which spell
+/// out every forwarding rule — are never readable or writable by other users
+/// (finding #7). Under the daemon's `umask(0)` a plain `create_dir_all` would
+/// make the first persist create it world-writable. An existing directory
+/// keeps whatever mode it already has.
+#[cfg(unix)]
+fn create_dir_owner_only(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_dir_owner_only(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)
 }
 
 /// Result of restoring a snapshot at startup.
