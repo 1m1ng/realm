@@ -24,8 +24,6 @@ use crate::lifecycle::{CancellationToken, Cohort, CohortHandle};
 
 use middle::connect_and_relay;
 
-pub use middle::connect_and_relay as relay_connection;
-
 /// Bind a tcp listener, reporting failures instead of aborting.
 pub fn bind_tcp(laddr: &SocketAddr, bind_opts: BindOpts) -> Result<TcpListener> {
     socket::bind(laddr, bind_opts)
