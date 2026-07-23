@@ -457,6 +457,15 @@ mod control {
         assert!(process["nofile_hard"].as_u64().unwrap_or(0) > 0);
         assert!(process["dns"]["nameservers"].is_array());
         assert!(process["features"].as_str().unwrap().contains("[control]"));
+
+        // finding #20: the compile-time tls backend is reported so an agent can
+        // detect provider drift, matching what docs/control-api.md promises. The
+        // default build links aws-lc.
+        assert_eq!(
+            process["tls_provider"], "aws-lc",
+            "the default build reports its tls provider for drift detection: {}",
+            process
+        );
     }
 
     /// Covers R21/R9: an endpoint that cannot bind never takes the process (or
