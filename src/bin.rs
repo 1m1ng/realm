@@ -21,6 +21,12 @@ cfg_if! {
     }
 }
 
+/// Report a fatal configuration error and exit, instead of aborting the process.
+fn fatal(e: impl std::fmt::Display) -> ! {
+    eprintln!("realm: {}", e);
+    std::process::exit(1)
+}
+
 fn main() {
     let conf = 'blk: {
         if let Ok(conf_str) = env::var(ENV_CONFIG) {
@@ -37,7 +43,7 @@ fn main() {
                 conf
             }
             CmdInput::Config(conf, opts) => {
-                let mut conf = FullConf::from_conf_file(&conf);
+                let mut conf = FullConf::from_conf_file(&conf).unwrap_or_else(|e| fatal(e));
                 conf.apply_global_opts().apply_cmd_opts(opts);
                 conf
             }
@@ -63,6 +69,7 @@ fn start_from_conf(full: FullConf) {
     let endpoints: Vec<EndpointInfo> = endpoints_conf
         .into_iter()
         .map(Config::build)
+        .map(|x| x.unwrap_or_else(|e| fatal(e)))
         .inspect(|x| println!("inited: {}", x.endpoint))
         .collect();
 
@@ -72,7 +79,7 @@ fn start_from_conf(full: FullConf) {
 fn setup_log(log: LogConf) {
     println!("log: {}", &log);
 
-    let (level, output) = log.build();
+    let (level, output) = log.build().unwrap_or_else(|e| fatal(e));
     fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
@@ -92,7 +99,7 @@ fn setup_log(log: LogConf) {
 fn setup_dns(dns: DnsConf) {
     println!("dns: {}", &dns);
 
-    let (conf, opts) = dns.build();
+    let (conf, opts) = dns.build().unwrap_or_else(|e| fatal(e));
     realm::core::dns::build_lazy(conf, opts);
 }
 

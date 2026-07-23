@@ -6,7 +6,7 @@ use realm_core::dns::config;
 use config::{LookupIpStrategy, NameServerConfig, ConnectionConfig, ProtocolConfig};
 use config::{ResolverConfig, ResolverOpts};
 
-use super::Config;
+use super::{BuildError, Config};
 
 // dns mode
 #[derive(Debug, Default, Serialize, Deserialize, Clone, Copy)]
@@ -176,19 +176,18 @@ impl Display for DnsConf {
             None => String::from("system"),
         };
 
-        write!(f, "mode={}, protocol={}, ", &mode, &protocol).unwrap();
+        write!(f, "mode={}, protocol={}, ", &mode, &protocol)?;
         write!(
             f,
             "min-ttl={}, max-ttl={}, cache-size={}, ",
             min_ttl, max_ttl, cache_size
-        )
-        .unwrap();
+        )?;
         write!(f, "servers={}", &nameservers)
     }
 }
 
 impl Config for DnsConf {
-    type Output = (Option<ResolverConfig>, Option<ResolverOpts>);
+    type Output = Result<(Option<ResolverConfig>, Option<ResolverOpts>), BuildError>;
 
     fn build(self) -> Self::Output {
         use crate::empty;
@@ -237,7 +236,7 @@ impl Config for DnsConf {
         };
 
         if matches!((&nameservers, &protocol), (&None, &None)) {
-            return (None, opts);
+            return Ok((None, opts));
         }
 
         // parse into ResolverConfig
@@ -254,17 +253,23 @@ impl Config for DnsConf {
                 conf.name_servers
             }
             // [ip1:port1, ip2:port2] => [ip1:[port1, port2]]
-            Some(addrs) => addrs
-                .into_iter()
-                .map(|x| x.to_socket_addrs().unwrap().next().unwrap())
-                .fold(Vec::new(), |mut nss: Vec<NameServerConfig>, addr| {
+            Some(addrs) => {
+                let mut nss: Vec<NameServerConfig> = Vec::with_capacity(addrs.len());
+                for x in addrs {
+                    let addr = x
+                        .to_socket_addrs()
+                        .map_err(|e| BuildError::new("dns.nameservers", &x, format!("cannot be resolved: {}", e)))?
+                        .next()
+                        .ok_or_else(|| BuildError::new("dns.nameservers", &x, "resolved to no address"))?;
+
                     if let Some(slot) = nss.iter_mut().find(|ns| ns.ip == addr.ip()) {
                         slot.connections.extend_from_slice(&tcp_and_udp(addr.port()))
                     } else {
                         nss.push(NameServerConfig::new(addr.ip(), true, tcp_and_udp(addr.port()).into()))
                     }
-                    nss
-                }),
+                }
+                nss
+            }
         };
 
         let protocols: Vec<ProtocolConfig> = protocol.unwrap_or_default().into();
@@ -274,7 +279,7 @@ impl Config for DnsConf {
             nss.connections.retain(|c| protocols.contains(&c.protocol));
             !nss.connections.is_empty()
         });
-        (Some(ResolverConfig::from_parts(None, Vec::new(), nameservers)), opts)
+        Ok((Some(ResolverConfig::from_parts(None, Vec::new(), nameservers)), opts))
     }
 
     fn rst_field(&mut self, other: &Self) -> &mut Self {
