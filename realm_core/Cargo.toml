@@ -45,4 +45,5 @@ multi-thread = []
 
 [dev-dependencies]
 env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros"] }

@@ -17,13 +17,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
+use std::io;
 use std::net::SocketAddr;
 
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, oneshot};
 
 use super::manager::{
     EndpointId, EndpointManager, EndpointSpec, EndpointStatus, Generation, Proto, SlotAction, SlotOutcome,
 };
+use super::snapshot::{RestoreOutcome, Snapshot, SnapshotStore};
 
 /// A desired endpoint, as submitted by the caller.
 #[derive(Debug, Clone)]
@@ -105,8 +109,10 @@ impl std::error::Error for ReconcileError {}
 /// A desired endpoint description the reconciler can diff and build.
 ///
 /// Implemented by the caller's own configuration shape, so that realm_core
-/// stays free of the serde-facing configuration types.
-pub trait EndpointSource: Clone + PartialEq + Send + Sync + 'static {
+/// stays free of the serde-facing configuration types. It must round-trip
+/// through serde, since the last-known-good snapshot stores exactly these
+/// descriptions (KTD9).
+pub trait EndpointSource: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static {
     /// Turn the description into a lifecycle spec, or say why it is invalid.
     ///
     /// Must have no side effect: it runs during the validation phase, before
@@ -147,8 +153,12 @@ pub struct Reconciler<S: EndpointSource> {
     active: Option<Generation>,
     /// response of the active generation, replayed for idempotent retries (R8)
     last: Option<ReconcileResponse>,
+    /// whether the active generation is only partially applied (R25, R34)
+    partial: bool,
     /// false until a snapshot restore has finished (R33)
     ready: bool,
+    /// where the last-known-good state is persisted (R19)
+    snapshot: Option<SnapshotStore>,
 }
 
 impl<S: EndpointSource> Default for Reconciler<S> {
@@ -164,7 +174,9 @@ impl<S: EndpointSource> Reconciler<S> {
             applied: BTreeMap::new(),
             active: None,
             last: None,
+            partial: false,
             ready: true,
+            snapshot: None,
         }
     }
 
@@ -173,6 +185,19 @@ impl<S: EndpointSource> Reconciler<S> {
     pub fn not_ready() -> Self {
         Self {
             ready: false,
+            ..Self::new()
+        }
+    }
+
+    /// Reconciler backed by a last-known-good snapshot.
+    ///
+    /// Starts out not ready: [`Reconciler::restore`] must run first, so that a
+    /// submission arriving during startup is refused as retryable instead of
+    /// being applied against an empty state (R33).
+    pub fn with_snapshot(store: SnapshotStore) -> Self {
+        Self {
+            ready: false,
+            snapshot: Some(store),
             ..Self::new()
         }
     }
@@ -191,12 +216,9 @@ impl<S: EndpointSource> Reconciler<S> {
         self.active
     }
 
-    /// Whether the active generation was only partially applied (R25).
+    /// Whether the active generation was only partially applied (R25, R34).
     pub fn is_partial(&self) -> bool {
-        matches!(
-            self.last.as_ref().map(|r| r.state),
-            Some(GenerationState::PartiallyApplied)
-        )
+        self.partial
     }
 
     /// The desired state currently applied, for snapshotting (R19).
@@ -253,8 +275,108 @@ impl<S: EndpointSource> Reconciler<S> {
         let response = self.apply_generation(generation, request.endpoints).await;
 
         self.active = Some(generation);
+        self.partial = response.state == GenerationState::PartiallyApplied;
         self.last = Some(response.clone());
+        self.persist();
         Ok(response)
+    }
+
+    /// Write the last-known-good snapshot, if one is configured.
+    ///
+    /// A failure here never fails the reconcile: the forwarding change is
+    /// already in effect, and losing the snapshot only costs a slower recovery
+    /// after a restart.
+    fn persist(&self) {
+        let Some(store) = &self.snapshot else {
+            return;
+        };
+
+        let snapshot = Snapshot {
+            generation: self.active.unwrap_or_default(),
+            partial: self.partial,
+            endpoints: self.applied.clone(),
+        };
+
+        if let Err(e) = store.store(&snapshot) {
+            log::error!("[reconcile]failed to write snapshot to {:?}: {}", store.path(), e);
+        }
+    }
+
+    /// Restore the last-known-good snapshot and become ready.
+    ///
+    /// Endpoints are restored one by one: one that cannot come back is marked
+    /// failed and the process keeps serving the rest, with the active
+    /// generation carrying the partial mark (R34). Only an unreadable or
+    /// corrupt snapshot is an error — restoring nothing where something was
+    /// expected would silently drop every endpoint.
+    pub async fn restore(&mut self) -> io::Result<RestoreOutcome> {
+        let Some(store) = self.snapshot.clone() else {
+            self.ready = true;
+            return Ok(RestoreOutcome::default());
+        };
+
+        let snapshot: Option<Snapshot<S>> = store.load()?;
+
+        let Some(snapshot) = snapshot else {
+            log::info!("[reconcile]no snapshot at {:?}, starting empty", store.path());
+            self.ready = true;
+            return Ok(RestoreOutcome::default());
+        };
+
+        let mut outcome = RestoreOutcome {
+            generation: Some(snapshot.generation),
+            partial: snapshot.partial,
+            ..RestoreOutcome::default()
+        };
+
+        for (id, spec) in snapshot.endpoints {
+            let built = match spec.build() {
+                Ok(x) => x,
+                Err(e) => {
+                    log::error!("[reconcile]cannot restore {}: {}", id, e);
+                    outcome.failed.push((id, e));
+                    continue;
+                }
+            };
+
+            let outcomes = self.manager.apply(id.clone(), snapshot.generation, built).await;
+            match outcomes.iter().find(|o| o.action == SlotAction::Failed) {
+                Some(failure) => {
+                    let error = failure.error.clone().unwrap_or_else(|| "failed to start".into());
+                    log::error!("[reconcile]cannot restore {}: {}", id, error);
+                    outcome.failed.push((id, error));
+                }
+                None => {
+                    outcome.restored += 1;
+                    self.applied.insert(id, spec);
+                }
+            }
+        }
+
+        outcome.partial |= !outcome.failed.is_empty();
+
+        self.active = Some(snapshot.generation);
+        self.partial = outcome.partial;
+        self.ready = true;
+
+        log::info!(
+            "[reconcile]restored generation {}: {} endpoints, {} failed",
+            snapshot.generation,
+            outcome.restored,
+            outcome.failed.len()
+        );
+
+        Ok(outcome)
+    }
+
+    /// Stop every endpoint this reconciler manages.
+    ///
+    /// Used when a process gives up its endpoints deliberately; the snapshot is
+    /// left untouched, since it describes the desired state, not the runtime.
+    pub async fn shutdown(&mut self) {
+        for id in self.manager.ids() {
+            self.manager.remove(&id, self.active.unwrap_or_default()).await;
+        }
     }
 
     async fn apply_generation(

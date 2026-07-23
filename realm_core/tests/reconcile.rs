@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -20,7 +21,7 @@ use realm_core::lifecycle::{
 
 /// Minimal stand-in for the top-level `EndpointConf`: the reconciler only
 /// needs to compare specs and turn them into lifecycle specs.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct TestSpec {
     listen: String,
     remote: SocketAddr,

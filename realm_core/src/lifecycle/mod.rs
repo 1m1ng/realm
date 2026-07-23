@@ -8,6 +8,7 @@
 pub mod cohort;
 pub mod manager;
 pub mod reconcile;
+pub mod snapshot;
 
 pub use cohort::{Cohort, CohortHandle, CohortStat, ConnGuard, DrainOutcome};
 pub use manager::{
@@ -15,6 +16,7 @@ pub use manager::{
     Generation, Proto, SlotAction, SlotOutcome, SlotState, SlotStatus,
 };
 
+pub use snapshot::{RestoreOutcome, SNAPSHOT_VERSION, Snapshot, SnapshotStore};
 pub use reconcile::{
     DesiredEndpoint, EndpointResult, EndpointSource, GenerationState, ReconcileError, ReconcileHandle,
     ReconcileRequest, ReconcileResponse, Reconciler, derive_id,
