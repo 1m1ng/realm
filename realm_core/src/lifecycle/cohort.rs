@@ -48,6 +48,15 @@ pub struct CohortHandle {
     alive: mpsc::Sender<()>,
 }
 
+/// Read-only view of a cohort, cheap to clone.
+///
+/// Lets the endpoint state machine report a cohort that is being drained by a
+/// background task it no longer owns.
+#[derive(Clone)]
+pub struct CohortStat {
+    inner: Arc<Inner>,
+}
+
 /// Held by one connection task for as long as it runs.
 pub struct ConnGuard {
     inner: Arc<Inner>,
@@ -86,6 +95,14 @@ impl Cohort {
                 let (tx, _rx) = mpsc::channel(1);
                 tx
             }),
+        }
+    }
+
+    /// Read-only view, usable after the cohort itself has been handed over to
+    /// a background drain.
+    pub fn stat(&self) -> CohortStat {
+        CohortStat {
+            inner: Arc::clone(&self.inner),
         }
     }
 
@@ -189,6 +206,28 @@ impl CohortHandle {
     /// Number of connections currently alive in this cohort.
     pub fn count(&self) -> usize {
         self.inner.count.load(Ordering::Acquire)
+    }
+}
+
+impl CohortStat {
+    /// Number of connections currently alive in this cohort.
+    pub fn count(&self) -> usize {
+        self.inner.count.load(Ordering::Acquire)
+    }
+
+    /// How long this cohort has existed.
+    pub fn age(&self) -> Duration {
+        self.inner.created.elapsed()
+    }
+
+    /// How long this cohort has been draining, if it is.
+    pub fn draining_for(&self) -> Option<Duration> {
+        self.inner
+            .draining_since
+            .lock()
+            .ok()
+            .and_then(|x| *x)
+            .map(|since| since.elapsed())
     }
 }
 

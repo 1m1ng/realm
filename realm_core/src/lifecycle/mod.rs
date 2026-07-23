@@ -6,8 +6,13 @@
 //! and (from the reconciler upwards) desired-state application.
 
 pub mod cohort;
+pub mod manager;
 
-pub use cohort::{Cohort, CohortHandle, ConnGuard, DrainOutcome};
+pub use cohort::{Cohort, CohortHandle, CohortStat, ConnGuard, DrainOutcome};
+pub use manager::{
+    DEFAULT_DELETE_DRAIN, DrainPolicy, DrainingStatus, EndpointId, EndpointManager, EndpointSpec, EndpointStatus,
+    Generation, Proto, SlotAction, SlotOutcome, SlotState, SlotStatus,
+};
 
 /// Re-exported so that users of the lifecycle API do not need to depend on
 /// `tokio-util` directly.
