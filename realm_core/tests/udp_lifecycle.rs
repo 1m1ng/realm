@@ -1,0 +1,155 @@
+//! UDP data plane ownership (U5 / R2, R16, R36).
+//!
+//! Associations outlive the receive loop that created them, so they must own
+//! everything they touch and observe cancellation themselves. Stopping an
+//! endpoint terminates every association and releases its socket.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::net::UdpSocket;
+use tokio::time::timeout;
+
+use realm_core::endpoint::{RemoteAddr, UdpRuntime};
+use realm_core::lifecycle::{CancellationToken, Cohort};
+use realm_core::udp::{bind_udp, serve_udp};
+
+/// An echo server that answers every datagram until the test drops it.
+async fn spawn_echo() -> std::net::SocketAddr {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 1500];
+        loop {
+            let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                return;
+            };
+            if sock.send_to(&buf[..n], peer).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    addr
+}
+
+fn runtime_for(remote: std::net::SocketAddr) -> Arc<UdpRuntime> {
+    Arc::new(UdpRuntime {
+        raddr: RemoteAddr::SocketAddr(remote),
+        conn_opts: Default::default(),
+    })
+}
+
+async fn roundtrip(client: &UdpSocket, relay: std::net::SocketAddr, payload: &[u8]) {
+    client.send_to(payload, relay).await.unwrap();
+    let mut buf = vec![0u8; 1500];
+    let (n, _) = timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+        .await
+        .expect("relay must answer in time")
+        .unwrap();
+    assert_eq!(&buf[..n], payload);
+}
+
+#[cfg(target_os = "linux")]
+fn open_fds() -> usize {
+    std::fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(0)
+}
+
+/// Covers AE7: a stopped udp endpoint terminates its associations in a
+/// controlled way — every task exits, the count drops to zero, and the
+/// outbound sockets are released.
+#[tokio::test]
+async fn stopping_an_endpoint_terminates_all_associations() {
+    let echo = spawn_echo().await;
+
+    let lis = bind_udp(&"127.0.0.1:0".parse().unwrap(), Default::default()).unwrap();
+    let laddr = lis.local_addr().unwrap();
+
+    let mut cohort = Cohort::new();
+    let shutdown = CancellationToken::new();
+    let serving = tokio::spawn(serve_udp(lis, runtime_for(echo), cohort.handle(), shutdown.clone()));
+
+    #[cfg(target_os = "linux")]
+    let fds_before = open_fds();
+
+    let mut clients = Vec::new();
+    for _ in 0..4 {
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        roundtrip(&client, laddr, b"ping").await;
+        clients.push(client);
+    }
+    assert_eq!(cohort.count(), 4, "every association is tracked");
+
+    // controlled teardown: stop receiving, cancel, wait for actual exit
+    shutdown.cancel();
+    timeout(Duration::from_secs(2), serving)
+        .await
+        .expect("receive loop must stop promptly")
+        .unwrap()
+        .unwrap();
+
+    cohort.cancel();
+    timeout(Duration::from_secs(5), cohort.wait_drained())
+        .await
+        .expect("associations must actually exit");
+    assert_eq!(cohort.count(), 0, "association count drops monotonically to zero");
+
+    #[cfg(target_os = "linux")]
+    {
+        // outbound sockets are closed again; allow slack for runtime internals
+        let fds_after = open_fds();
+        assert!(
+            fds_after <= fds_before + 1,
+            "outbound sockets leaked: {} -> {}",
+            fds_before,
+            fds_after
+        );
+    }
+}
+
+/// Covers R16: after a controlled rebuild the client's next datagram creates a
+/// fresh association against the new configuration.
+#[tokio::test]
+async fn associations_are_rebuilt_after_a_restart() {
+    let echo = spawn_echo().await;
+    let laddr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    let lis = bind_udp(&laddr, Default::default()).unwrap();
+    let bound = lis.local_addr().unwrap();
+
+    let mut first = Cohort::new();
+    let shutdown = CancellationToken::new();
+    let serving = tokio::spawn(serve_udp(lis, runtime_for(echo), first.handle(), shutdown.clone()));
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    roundtrip(&client, bound, b"first generation").await;
+    assert_eq!(first.count(), 1);
+
+    shutdown.cancel();
+    let _ = timeout(Duration::from_secs(2), serving).await.expect("stops promptly");
+    first.cancel();
+    timeout(Duration::from_secs(5), first.wait_drained())
+        .await
+        .expect("old associations exit");
+
+    // rebind the same port and serve a new generation
+    let echo2 = spawn_echo().await;
+    let lis = bind_udp(&bound, Default::default()).unwrap();
+    let second = Cohort::new();
+    let shutdown2 = CancellationToken::new();
+    tokio::spawn(serve_udp(lis, runtime_for(echo2), second.handle(), shutdown2));
+
+    roundtrip(&client, bound, b"second generation").await;
+    assert_eq!(second.count(), 1, "the client rebuilt its association");
+}
+
+/// Covers R10 for udp: a failing bind is an error, not a panic.
+#[tokio::test]
+async fn bind_failure_is_reported_as_an_error() {
+    let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = occupied.local_addr().unwrap();
+
+    let err = bind_udp(&addr, Default::default()).expect_err("port is taken");
+    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+}
