@@ -19,11 +19,21 @@ A simple, high performance relay server written in rust.
 | realm-hook | [![crates.io](https://img.shields.io/crates/v/realm_hook.svg)](https://crates.io/crates/realm_hook) [![Released API docs](https://docs.rs/realm_hook/badge.svg)](https://docs.rs/realm_hook)|
 | realm-syscall | [![crates.io](https://img.shields.io/crates/v/realm_syscall.svg)](https://crates.io/crates/realm_syscall) [![Released API docs](https://docs.rs/realm_syscall/badge.svg)](https://docs.rs/realm_syscall) |
 
+> **This is a private fork.** On top of upstream v2.9.4 it adds per-endpoint
+> hot reload: an agent publishes the node's desired state over a unix socket and
+> realm changes only the endpoints that actually changed — no restart, and
+> established tcp connections keep running on the configuration they were
+> accepted under. See [docs/control-api.md](docs/control-api.md).
+>
+> Without `--control-socket` the binary behaves exactly like upstream.
+
 ## Features
 
 - Zero configuration. Setup and run in one command.
 - Concurrency. Bidirectional concurrent traffic leads to high performance.
 - Low resources cost.
+- Hot reload. Change one forwarding rule without restarting the process or
+  disturbing the others ([control api](docs/control-api.md)).
 
 ## Container
 
@@ -148,6 +158,10 @@ SYS OPTIONS:
   -p, --pipe-page <number>    set pipe capacity
   -j, --pre-conn-hook <path>  set pre-connect hook
 
+CONTROL OPTIONS:
+      --control-socket <path>  serve the reconcile api on this unix socket
+      --state-file <path>      where to keep the last-known-good state (default: alongside the control socket)
+
 LOG OPTIONS:
       --log-level <level>  override log level
       --log-output <path>  override log output
@@ -194,10 +208,24 @@ realm -c config.json
 realm -c config/
 ```
 
+Start with a control plane, so endpoints can be changed without a restart:
+
+```shell
+realm -c config.toml --control-socket /run/realm/realm.sock
+
+# what is running right now
+curl --unix-socket /run/realm/realm.sock http://localhost/v1/status
+```
+
+The full contract is in [docs/control-api.md](docs/control-api.md).
+
 Start with environment variables:
 
 ```shell
 REALM_CONF='{"endpoints":[{"local":"127.0.0.1:5000","remote":"1.1.1.1:443"}]}' realm
+
+# the control socket has its own variable on this path
+REALM_CONTROL_SOCKET=/run/realm/realm.sock REALM_CONF=`cat config.json | jq -c` realm
 
 # or
 export REALM_CONF=`cat config.json | jq -c `
