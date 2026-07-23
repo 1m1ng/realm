@@ -23,7 +23,11 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(name: &str) -> Self {
-        let mut path = std::env::temp_dir();
+        // A short base: macOS caps unix socket paths at ~104 bytes, and the CI
+        // runner's $TMPDIR (`/var/folders/...`) is long enough that a socket
+        // under it overflows `sun_path` and `bind` fails with EINVAL. `/tmp` is
+        // short and always present on the unix platforms this file compiles for.
+        let mut path = PathBuf::from("/tmp");
         path.push(format!("realm-control-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();

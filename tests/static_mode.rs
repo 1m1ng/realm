@@ -25,6 +25,14 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(name: &str) -> Self {
+        // A short base on unix: the control-socket subtests bind sockets under
+        // this dir, and macOS caps unix socket paths at ~104 bytes while the CI
+        // runner's $TMPDIR is long enough to overflow `sun_path`. `/tmp` is short
+        // and always present on unix; Windows has no `/tmp`, but it also has no
+        // control-socket subtests, so its temp dir is fine there.
+        #[cfg(unix)]
+        let mut path = PathBuf::from("/tmp");
+        #[cfg(not(unix))]
         let mut path = std::env::temp_dir();
         path.push(format!("realm-static-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
