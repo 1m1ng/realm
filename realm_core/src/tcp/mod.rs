@@ -41,7 +41,7 @@ pub async fn run_tcp(endpoint: Endpoint) -> Result<()> {
     let lis = match bind_tcp(&endpoint.laddr, endpoint.bind_opts) {
         Ok(x) => x,
         Err(e) => {
-            log::error!("[tcp]failed to bind {}: {}", &endpoint.laddr, e);
+            log::error!("[tcp]failed to bind {}: {}", endpoint.laddr, e);
             return Err(e);
         }
     };
@@ -103,11 +103,11 @@ pub async fn serve_tcp(
             let raddr = runtime.raddr.clone();
             tokio::select! {
                 _ = guard.token().cancelled() => {
-                    log::debug!("[tcp]{} => {}, cancelled", addr, &raddr);
+                    log::debug!("[tcp]{} => {}, cancelled", addr, raddr);
                 }
                 res = connect_and_relay(local, Arc::clone(&runtime)) => match res {
-                    Ok(..) => log::debug!("[tcp]{} => {}, finish", addr, &raddr),
-                    Err(e) => log::error!("[tcp]{} => {}, error: {}", addr, &raddr, e),
+                    Ok(..) => log::debug!("[tcp]{} => {}, finish", addr, raddr),
+                    Err(e) => log::error!("[tcp]{} => {}, error: {}", addr, raddr, e),
                 },
             }
             // the guard is released here, and only here: the cohort reports

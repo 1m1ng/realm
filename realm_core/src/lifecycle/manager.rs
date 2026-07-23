@@ -89,6 +89,12 @@ pub struct SlotOutcome {
     pub proto: Proto,
     pub action: SlotAction,
     pub error: Option<String>,
+    /// For a failure: whether resubmitting the same desired state may succeed.
+    ///
+    /// A bind that lost a race with another process is worth retrying; a
+    /// configuration realm cannot make sense of is not (R31). `None` when the
+    /// operation did not fail.
+    pub retryable: Option<bool>,
 }
 
 impl SlotOutcome {
@@ -97,14 +103,28 @@ impl SlotOutcome {
             proto,
             action,
             error: None,
+            retryable: None,
         }
     }
 
+    /// A failure the caller may retry: binding, and anything else the operating
+    /// system refused for a reason that can change on its own.
     fn failed(proto: Proto, error: impl Display) -> Self {
         Self {
             proto,
             action: SlotAction::Failed,
             error: Some(error.to_string()),
+            retryable: Some(true),
+        }
+    }
+
+    /// A failure that will fail again unchanged.
+    fn rejected(proto: Proto, error: impl Display) -> Self {
+        Self {
+            proto,
+            action: SlotAction::Failed,
+            error: Some(error.to_string()),
+            retryable: Some(false),
         }
     }
 }
@@ -268,7 +288,7 @@ impl EndpointManager {
             return spec
                 .protos()
                 .into_iter()
-                .map(|proto| SlotOutcome::failed(proto, e.clone()))
+                .map(|proto| SlotOutcome::rejected(proto, e.clone()))
                 .collect();
         }
 

@@ -58,6 +58,9 @@ pub struct EndpointResult {
     pub proto: Proto,
     pub action: SlotAction,
     pub error: Option<String>,
+    /// For a failure: whether resubmitting the same desired state may succeed
+    /// (R31). `None` when this endpoint did not fail.
+    pub retryable: Option<bool>,
 }
 
 /// Answer to a submission.
@@ -440,11 +443,15 @@ impl<S: EndpointSource> Reconciler<S> {
                             proto,
                             action: SlotAction::Unchanged,
                             error: None,
+                            retryable: None,
                         });
                     }
                 }
                 Plan::Invalid { error } => {
-                    // an invalid endpoint keeps whatever was serving before
+                    // an invalid endpoint keeps whatever was serving before.
+                    // A brand new one has no slots yet and its protocols could
+                    // not be determined either — validation is what failed — so
+                    // it is reported once, under tcp.
                     let protos = self.protos_of(&id);
                     let protos = if protos.is_empty() { vec![Proto::Tcp] } else { protos };
                     desired.remove(&id);
@@ -454,6 +461,9 @@ impl<S: EndpointSource> Reconciler<S> {
                             proto,
                             action: SlotAction::Failed,
                             error: Some(error.clone()),
+                            // a description realm cannot make sense of will not
+                            // start making sense on a retry (R31)
+                            retryable: Some(false),
                         });
                     }
                 }
@@ -628,6 +638,7 @@ fn into_results(id: &str, outcomes: Vec<SlotOutcome>) -> Vec<EndpointResult> {
             proto: o.proto,
             action: o.action,
             error: o.error,
+            retryable: o.retryable,
         })
         .collect()
 }

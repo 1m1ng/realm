@@ -128,7 +128,7 @@ impl ControlServer {
         // the socket file outlives the listener otherwise, and would then look
         // like a live control plane to the next process
         let _ = fs::remove_file(&self.path);
-        log::info!("[control]stopped serving {:?}", &self.path);
+        log::info!("[control]stopped serving {:?}", self.path);
     }
 
     /// Bind and serve in one step.

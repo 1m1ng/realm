@@ -127,8 +127,8 @@ pub async fn associate_and_relay(
         .await?
         .iter()
         .next()
-        .ok_or_else(|| std::io::Error::other(format!("{} resolved to no address", &runtime.raddr)))?;
-    log::debug!("[udp]{} resolved as {}", &runtime.raddr, raddr);
+        .ok_or_else(|| std::io::Error::other(format!("{} resolved to no address", runtime.raddr)))?;
+    log::debug!("[udp]{} resolved as {}", runtime.raddr, raddr);
 
     registry.group_by_addr();
     for pkts in registry.group_iter() {
@@ -143,7 +143,7 @@ pub async fn associate_and_relay(
                 Arc::clone(sockmap),
                 cohort.register(),
             ));
-            log::info!("[udp]new association {} => {} as {}", laddr, &runtime.raddr, raddr);
+            log::info!("[udp]new association {} => {} as {}", laddr, runtime.raddr, raddr);
             Result::Ok(s)
         })?;
         let raddr: SockAddrStore = raddr.into();
@@ -173,7 +173,7 @@ async fn send_back(
         let received = tokio::select! {
             biased;
             _ = guard.token().cancelled() => {
-                log::debug!("[udp]association for {} cancelled", &laddr);
+                log::debug!("[udp]association for {} cancelled", laddr);
                 break;
             }
             res = timeoutfut(registry.batched_recv_on(&rsock), timeout) => res,
@@ -198,7 +198,7 @@ async fn send_back(
         let sent = tokio::select! {
             biased;
             _ = guard.token().cancelled() => {
-                log::debug!("[udp]association for {} cancelled", &laddr);
+                log::debug!("[udp]association for {} cancelled", laddr);
                 break;
             }
             res = batched::send_all(&lsock, pkts) => res,

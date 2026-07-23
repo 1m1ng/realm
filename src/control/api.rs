@@ -74,6 +74,9 @@ struct EndpointResultDto {
     action: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// present only on a failure: whether resubmitting may succeed (R31)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retryable: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -279,6 +282,7 @@ async fn reconcile(state: ApiState, req: Request<Incoming>) -> Response<BoxBody>
                             protocol: proto_str(r.proto),
                             action: action_str(r.action),
                             error: r.error,
+                            retryable: r.retryable,
                         })
                         .collect(),
                 },

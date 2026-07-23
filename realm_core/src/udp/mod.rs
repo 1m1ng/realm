@@ -32,7 +32,7 @@ pub async fn run_udp(endpoint: Endpoint) -> Result<()> {
     let lis = match bind_udp(&endpoint.laddr, endpoint.bind_opts) {
         Ok(x) => x,
         Err(e) => {
-            log::error!("[udp]failed to bind {}: {}", &endpoint.laddr, e);
+            log::error!("[udp]failed to bind {}: {}", endpoint.laddr, e);
             return Err(e);
         }
     };

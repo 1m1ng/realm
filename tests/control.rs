@@ -333,6 +333,67 @@ async fn an_invalid_endpoint_is_reported_per_endpoint() {
     assert_eq!(good_result["action"], "created");
 }
 
+/// Covers R31 per endpoint: an agent must be able to tell a failure worth
+/// retrying from one that will fail again unchanged.
+#[tokio::test]
+async fn endpoint_failures_say_whether_a_retry_can_help() {
+    let dir = TempDir::new("retryable");
+    let (socket, _shutdown) = serve(&dir, Reconciler::new()).await;
+
+    let echo = spawn_echo("v1:").await;
+
+    // somebody else owns this port: a bind race, which can resolve on its own
+    let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let taken_addr = taken.local_addr().unwrap();
+
+    let (code, body) = call(
+        &socket,
+        "PUT",
+        "/v1/desired-state",
+        Some(&desired(
+            1,
+            json!([
+                { "id": "occupied", "listen": taken_addr.to_string(), "remote": echo.to_string() },
+                { "id": "nonsense", "listen": "not an address", "remote": echo.to_string() },
+            ]),
+        )),
+    )
+    .await;
+
+    assert_eq!(code, 200);
+    let results = body["results"].as_array().unwrap();
+
+    let occupied = results.iter().find(|r| r["id"] == "occupied").unwrap();
+    assert_eq!(occupied["action"], "failed");
+    assert_eq!(
+        occupied["retryable"], true,
+        "a lost bind race may resolve itself: {}",
+        occupied
+    );
+
+    let nonsense = results.iter().find(|r| r["id"] == "nonsense").unwrap();
+    assert_eq!(nonsense["action"], "failed");
+    assert_eq!(
+        nonsense["retryable"], false,
+        "an unparseable endpoint will not parse on a retry: {}",
+        nonsense
+    );
+
+    // a successful result carries no retryable field at all
+    let (_, body) = call(
+        &socket,
+        "PUT",
+        "/v1/desired-state",
+        Some(&desired(
+            2,
+            json!([{ "id": "fine", "listen": free_addr().to_string(), "remote": echo.to_string() }]),
+        )),
+    )
+    .await;
+    assert_eq!(body["results"][0]["action"], "created");
+    assert!(body["results"][0].get("retryable").is_none());
+}
+
 /// Covers R12: the control plane refuses to allocate without bound.
 #[tokio::test]
 async fn an_oversized_request_is_refused_as_terminal() {
