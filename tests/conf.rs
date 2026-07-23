@@ -134,3 +134,134 @@ fn cli_rejects_invalid_config_with_nonzero_exit() {
         stderr
     );
 }
+
+// The load balancer and transport option strings are handed to third-party
+// parsers (`realm_lb`, `kaminari`) that `panic!` on malformed input. Since a
+// control-plane request reaches `EndpointConf::build` on the reconciler task, a
+// panic there would take the whole control plane down (finding #2). Building
+// must reject every malformed value with a structured error instead.
+
+#[cfg(feature = "balance")]
+#[test]
+fn balance_without_strategy_separator_reports_field() {
+    let ep = single_endpoint(
+        r#"
+[[endpoints]]
+listen = "127.0.0.1:10000"
+remote = "127.0.0.1:20000"
+balance = "roundrobin"
+"#,
+    );
+
+    let err = ep.build().expect_err("a balance value with no `:` must be rejected");
+    assert!(err.to_string().contains("balance"), "{}", err);
+}
+
+#[cfg(feature = "balance")]
+#[test]
+fn balance_unknown_strategy_is_rejected_not_panicking() {
+    // `realm_lb::Strategy::from` panics on anything but off/iphash/roundrobin.
+    let ep = single_endpoint(
+        r#"
+[[endpoints]]
+listen = "127.0.0.1:10000"
+remote = "127.0.0.1:20000"
+balance = "nonsense: 1"
+"#,
+    );
+
+    let err = ep
+        .build()
+        .expect_err("an unknown balance strategy must be rejected, not panic");
+    assert!(err.to_string().contains("balance"), "{}", err);
+}
+
+#[cfg(feature = "balance")]
+#[test]
+fn balance_weight_count_mismatch_reports_field() {
+    // one remote (no extra_remotes) but three weights.
+    let ep = single_endpoint(
+        r#"
+[[endpoints]]
+listen = "127.0.0.1:10000"
+remote = "127.0.0.1:20000"
+balance = "roundrobin: 1, 2, 3"
+"#,
+    );
+
+    let err = ep
+        .build()
+        .expect_err("a weight count that does not match the remotes must be rejected");
+    assert!(err.to_string().contains("balance"), "{}", err);
+}
+
+#[cfg(feature = "balance")]
+#[test]
+fn valid_balance_still_builds() {
+    let ep = single_endpoint(
+        r#"
+[[endpoints]]
+listen = "127.0.0.1:10000"
+remote = "127.0.0.1:20000"
+extra_remotes = ["127.0.0.1:20001"]
+balance = "roundrobin: 1, 2"
+"#,
+    );
+
+    ep.build().expect("a well-formed balance value must still build");
+}
+
+#[cfg(feature = "transport")]
+#[test]
+fn malformed_listen_transport_is_rejected_not_panicking() {
+    // `kaminari::get_ws_conf("ws")` panics: the `ws` option is present but host
+    // and path are missing.
+    let ep = single_endpoint(
+        r#"
+[[endpoints]]
+listen = "127.0.0.1:10000"
+remote = "127.0.0.1:20000"
+listen_transport = "ws"
+"#,
+    );
+
+    let err = ep
+        .build()
+        .expect_err("a malformed listen transport must be rejected, not panic");
+    assert!(err.to_string().contains("listen_transport"), "{}", err);
+}
+
+#[cfg(feature = "transport")]
+#[test]
+fn malformed_remote_transport_is_rejected_not_panicking() {
+    // `kaminari::get_tls_client_conf("tls")` panics: `tls` is present but `sni`
+    // is missing.
+    let ep = single_endpoint(
+        r#"
+[[endpoints]]
+listen = "127.0.0.1:10000"
+remote = "127.0.0.1:20000"
+remote_transport = "tls"
+"#,
+    );
+
+    let err = ep
+        .build()
+        .expect_err("a malformed remote transport must be rejected, not panic");
+    assert!(err.to_string().contains("remote_transport"), "{}", err);
+}
+
+#[cfg(feature = "transport")]
+#[test]
+fn valid_transport_still_builds() {
+    let ep = single_endpoint(
+        r#"
+[[endpoints]]
+listen = "127.0.0.1:10000"
+remote = "127.0.0.1:20000"
+listen_transport = "ws;host=example.com;path=/tunnel"
+"#,
+    );
+
+    ep.build().expect("a well-formed transport value must still build");
+}

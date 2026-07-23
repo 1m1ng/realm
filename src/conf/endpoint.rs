@@ -125,9 +125,23 @@ impl EndpointConf {
         };
 
         // `Balancer::parse_from_str` panics without the strategy separator
-        let Some((_, weights)) = s.split_once(':') else {
+        let Some((strategy, weights)) = s.split_once(':') else {
             return Err(BuildError::new("balance", s, "expected `strategy: weight, ...`"));
         };
+
+        // `realm_lb::Strategy::from` panics on anything but these; validate the
+        // token before `parse_from_str` reaches it, so a control-plane request
+        // cannot panic the reconciler (finding #2)
+        if !matches!(strategy.trim(), "off" | "iphash" | "roundrobin") {
+            return Err(BuildError::new(
+                "balance",
+                s,
+                format!(
+                    "unknown strategy `{}` (expected off, iphash or roundrobin)",
+                    strategy.trim()
+                ),
+            ));
+        }
 
         let balancer = Balancer::parse_from_str(s);
 
@@ -160,7 +174,7 @@ impl EndpointConf {
     }
 
     #[cfg(feature = "transport")]
-    fn build_transport(&self) -> Option<(MixAccept, MixConnect)> {
+    fn build_transport(&self) -> Result<Option<(MixAccept, MixConnect)>, BuildError> {
         use realm_core::kaminari::mix::{MixClientConf, MixServerConf};
         use realm_core::kaminari::opt::get_ws_conf;
         use realm_core::kaminari::opt::get_tls_client_conf;
@@ -172,17 +186,42 @@ impl EndpointConf {
             ..
         } = self;
 
-        let listen_ws = listen_transport.as_ref().and_then(|s| get_ws_conf(s));
-        let listen_tls = listen_transport.as_ref().and_then(|s| get_tls_server_conf(s));
+        // kaminari's option parsers `panic!` on a malformed string (`get_ws_conf`
+        // when `ws` is present but host/path are missing, `get_tls_*_conf` when
+        // `tls` is present but sni/cert are missing). Since this runs on the
+        // reconciler task for a control-plane request, a panic would take the
+        // whole control plane down (finding #2) — so any panic is caught here
+        // and turned into a structured error naming the field.
+        fn guard<T>(field: &'static str, value: &Option<String>, f: impl FnOnce() -> T) -> Result<T, BuildError> {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|e| {
+                let reason = e
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| e.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| String::from("invalid transport options"));
+                BuildError::new(field, value.as_deref().unwrap_or_default(), reason)
+            })
+        }
 
-        let remote_ws = remote_transport.as_ref().and_then(|s| get_ws_conf(s));
-        let remote_tls = remote_transport.as_ref().and_then(|s| get_tls_client_conf(s));
+        let listen_ws = guard("listen_transport", listen_transport, || {
+            listen_transport.as_ref().and_then(|s| get_ws_conf(s))
+        })?;
+        let listen_tls = guard("listen_transport", listen_transport, || {
+            listen_transport.as_ref().and_then(|s| get_tls_server_conf(s))
+        })?;
+
+        let remote_ws = guard("remote_transport", remote_transport, || {
+            remote_transport.as_ref().and_then(|s| get_ws_conf(s))
+        })?;
+        let remote_tls = guard("remote_transport", remote_transport, || {
+            remote_transport.as_ref().and_then(|s| get_tls_client_conf(s))
+        })?;
 
         if matches!(
             (&listen_ws, &listen_tls, &remote_ws, &remote_tls),
             (None, None, None, None)
         ) {
-            None
+            Ok(None)
         } else {
             let ac = MixAccept::new_shared(MixServerConf {
                 ws: listen_ws,
@@ -192,7 +231,7 @@ impl EndpointConf {
                 ws: remote_ws,
                 tls: remote_tls,
             });
-            Some((ac, cc))
+            Ok(Some((ac, cc)))
         }
     }
 }
@@ -241,7 +280,7 @@ impl Config for EndpointConf {
 
         #[cfg(feature = "transport")]
         {
-            conn_opts.transport = self.build_transport();
+            conn_opts.transport = self.build_transport()?;
         }
 
         // build left fields of bind_opts and conn_opts
