@@ -12,7 +12,7 @@ use crate::endpoint::UdpRuntime;
 use crate::lifecycle::{CohortHandle, ConnGuard};
 
 use batched::{Packet, SockAddrStore};
-use registry::Registry;
+pub(super) use registry::Registry;
 mod registry {
     use super::*;
     type Range = std::ops::Range<u16>;
@@ -109,6 +109,12 @@ mod registry {
 /// Receive a batch of datagrams from the entry socket and forward them,
 /// creating the association tasks that route the answers back.
 ///
+/// The `registry` is owned by the caller's receive loop and reused across
+/// batches: `batched_recv_on` overwrites its cursor with the new count and
+/// `group_by_addr` regroups only that prefix, so nothing from a prior batch
+/// is reprocessed. Allocating it once per socket (rather than once per batch)
+/// keeps the ~205 KiB packet buffer off the hot path.
+///
 /// Everything an association needs is handed to it as an owned `Arc`, so it
 /// stays valid even after this loop — and the endpoint generation it belongs
 /// to — is gone.
@@ -117,9 +123,8 @@ pub async fn associate_and_relay(
     runtime: &Arc<UdpRuntime>,
     sockmap: &Arc<SockMap>,
     cohort: &CohortHandle,
+    registry: &mut Registry,
 ) -> Result<()> {
-    let mut registry = Registry::new(batched::MAX_PACKETS);
-
     registry.batched_recv_on(lis).await?;
     log::debug!("[udp]entry batched recvfrom[{}]", registry.count());
 
