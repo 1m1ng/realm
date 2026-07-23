@@ -6,6 +6,7 @@ pub mod udp;
 pub mod time;
 pub mod trick;
 pub mod endpoint;
+pub mod lifecycle;
 
 pub use realm_io;
 pub use realm_syscall;
