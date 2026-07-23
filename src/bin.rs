@@ -100,7 +100,7 @@ fn setup_dns(dns: DnsConf) {
     println!("dns: {}", &dns);
 
     let (conf, opts) = dns.build().unwrap_or_else(|e| fatal(e));
-    realm::core::dns::build_lazy(conf, opts);
+    realm::core::dns::build_lazy(conf, opts).unwrap_or_else(|e| fatal(e));
 }
 
 fn setup_transport() {

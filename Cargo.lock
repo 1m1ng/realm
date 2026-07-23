@@ -1666,7 +1666,6 @@ dependencies = [
  "hickory-resolver",
  "kaminari",
  "log",
- "once_cell",
  "pin-project",
  "proxy-protocol",
  "realm_hook 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",

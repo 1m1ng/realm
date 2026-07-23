@@ -1,21 +1,20 @@
-#![allow(static_mut_refs)]
-
 //! Global dns resolver.
+//!
+//! The resolver is a process-wide singleton frozen at the first use: it is set
+//! up once during startup and never changes afterwards (per-endpoint resolver
+//! configuration is a deliberate product limit, not an oversight). Both the
+//! configuration and the resolver live in `OnceLock`s, so a second attempt to
+//! configure it reports an error instead of aborting the process.
 
 use std::io::{Result, Error};
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 
 use hickory_resolver as resolver;
 use resolver::TokioResolver;
 use resolver::system_conf::read_system_conf;
 use resolver::lookup_ip::{LookupIp, LookupIpIter};
 use resolver::config::{ResolverOpts, ResolverConfig};
-
-#[cfg(not(feature = "multi-thread"))]
-use once_cell::unsync::{OnceCell, Lazy};
-
-#[cfg(feature = "multi-thread")]
-use once_cell::{unsync::OnceCell, sync::Lazy};
 
 use crate::endpoint::RemoteAddr;
 
@@ -45,35 +44,55 @@ impl Default for DnsConf {
     }
 }
 
-static mut DNS_CONF: OnceCell<DnsConf> = OnceCell::new();
+static DNS_CONF: OnceLock<DnsConf> = OnceLock::new();
 
-static mut DNS: Lazy<TokioResolver> = Lazy::new(|| {
-    use resolver::net::runtime::TokioRuntimeProvider as Tokio;
+/// `None` records that the resolver could not be built with the effective
+/// configuration; lookups then fail instead of taking the process down.
+static DNS: OnceLock<Option<TokioResolver>> = OnceLock::new();
 
-    let DnsConf { conf, opts } = unsafe { DNS_CONF.take().unwrap() };
-    TokioResolver::builder_with_config(conf, Tokio::default())
-        .with_options(opts)
-        .build()
-        .unwrap()
-});
+/// Get the global dns resolver, building it on first use.
+///
+/// Building freezes the effective configuration: either the one installed by
+/// [`build_lazy`], or the system defaults when nothing was installed.
+fn resolver() -> Result<&'static TokioResolver> {
+    DNS.get_or_init(|| {
+        use resolver::net::runtime::TokioRuntimeProvider as Tokio;
 
-/// Force initialization.
-pub fn force_init() {
-    use std::ptr;
-    unsafe {
-        Lazy::force(&*ptr::addr_of!(DNS));
-    }
+        let DnsConf { conf, opts } = DNS_CONF.get_or_init(DnsConf::default).clone();
+
+        match TokioResolver::builder_with_config(conf, Tokio::default())
+            .with_options(opts)
+            .build()
+        {
+            Ok(x) => Some(x),
+            Err(e) => {
+                log::error!("[dns]failed to build resolver: {}", e);
+                None
+            }
+        }
+    })
+    .as_ref()
+    .ok_or_else(|| Error::other("dns resolver is unavailable"))
 }
 
-/// Setup global dns resolver. This is not thread-safe!
-pub fn build(conf: Option<ResolverConfig>, opts: Option<ResolverOpts>) {
-    build_lazy(conf, opts);
+/// Force initialization, freezing the effective configuration.
+pub fn force_init() {
+    let _ = resolver();
+}
+
+/// Setup global dns resolver.
+///
+/// Returns an error if the resolver has already been configured or initialized.
+pub fn build(conf: Option<ResolverConfig>, opts: Option<ResolverOpts>) -> Result<()> {
+    build_lazy(conf, opts)?;
     force_init();
+    Ok(())
 }
 
 /// Setup config of global dns resolver, without initialization.
-/// This is not thread-safe!
-pub fn build_lazy(conf: Option<ResolverConfig>, opts: Option<ResolverOpts>) {
+///
+/// Returns an error if the resolver has already been configured or initialized.
+pub fn build_lazy(conf: Option<ResolverConfig>, opts: Option<ResolverOpts>) -> Result<()> {
     let mut dns_conf = DnsConf::default();
 
     if let Some(conf) = conf {
@@ -84,14 +103,23 @@ pub fn build_lazy(conf: Option<ResolverConfig>, opts: Option<ResolverOpts>) {
         dns_conf.opts = opts;
     }
 
-    unsafe {
-        DNS_CONF.set(dns_conf).unwrap();
-    }
+    DNS_CONF
+        .set(dns_conf)
+        .map_err(|_| Error::other("dns resolver is already configured"))
+}
+
+/// Effective dns configuration, once it has been frozen.
+///
+/// `None` means nothing has been installed and the resolver has not been used
+/// yet. Exposed so that the control plane can report the process-wide settings
+/// an agent cannot change at runtime.
+pub fn effective_conf() -> Option<&'static DnsConf> {
+    DNS_CONF.get()
 }
 
 /// Lookup ip with global dns resolver.
 pub async fn resolve_ip(ip: &str) -> Result<LookupIp> {
-    unsafe { DNS.lookup_ip(ip).await.map_or_else(|e| Err(Error::other(e)), Ok) }
+    resolver()?.lookup_ip(ip).await.map_err(Error::other)
 }
 
 /// Lookup socketaddr with global dns resolver.
