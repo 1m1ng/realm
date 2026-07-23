@@ -9,7 +9,6 @@
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -89,20 +88,18 @@ pub async fn bind(path: &Path) -> io::Result<UnixListener> {
 
     // Create the socket owner-only from the outset. Its mode at creation is
     // `0o777 & ~umask`, and a daemonized realm runs under `umask(0)`, so without
-    // this guard the socket is world-connectable in the window between `bind`
-    // and any later chmod. Force a `0o077` umask across the bind and restore the
-    // previous one immediately, so nothing else observes the tightened value.
+    // this guard the socket would be world-connectable in the window between
+    // `bind` and any later chmod. Forcing `umask(0o077)` across the bind makes
+    // the socket `0o700` at creation itself, which also avoids a path-based
+    // `set_permissions` that a symlink at `path` could redirect. `umask` is
+    // portable; `fchmod` on a socket fd is not (macOS returns EINVAL). Restore
+    // the previous umask immediately so nothing else observes the tightened
+    // value. (Startup binds this on a single thread, so the save/restore is not
+    // racing another bind.)
     let previous_umask = unsafe { libc::umask(0o077) };
     let bound = UnixListener::bind(path);
     unsafe { libc::umask(previous_umask) };
     let listener = bound?;
-
-    // Apply the final mode on the listener's own file descriptor rather than by
-    // path: `fchmod` cannot be redirected through a symlink at `path` the way a
-    // path-based `set_permissions` can, and it needs no second lookup.
-    if unsafe { libc::fchmod(listener.as_raw_fd(), OWNER_ONLY as libc::mode_t) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
 
     log::info!("[control]listening on {:?}", path);
     Ok(listener)
