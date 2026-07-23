@@ -485,6 +485,72 @@ async fn an_existing_directory_keeps_its_permissions() {
     assert_eq!(code, 200);
 }
 
+/// Covers R12/R30 (finding #13): the freshly-bound control socket is owner-only
+/// at creation, even under a permissive umask and in a group/world-reachable
+/// parent directory. Binding under `umask(0)` (the state a daemonized realm is
+/// in) would otherwise create the socket 0o777 — world-connectable in the
+/// window before any chmod could tighten it. The umask guard around `bind` is
+/// what closes that window; this asserts the socket's creation-time mode, so it
+/// exercises the guard rather than a post-hoc chmod.
+#[tokio::test]
+async fn the_socket_is_owner_only_under_a_permissive_umask() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new("permissive-umask");
+    // a shared, world-reachable parent directory, like /run or /tmp
+    let shared = dir.0.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = shared.join("realm.sock");
+
+    // the most permissive umask possible: without the guard the socket would be
+    // created 0o777
+    let previous = unsafe { libc::umask(0) };
+
+    let shutdown = CancellationToken::new();
+    let server = ControlServer::new(Reconciler::<EndpointConf>::new().spawn(), Default::default(), &socket);
+    let listener = server.bind().await.expect("control socket binds");
+
+    // restore before asserting, so a failing assertion cannot leak umask 0 into
+    // the rest of the process
+    unsafe { libc::umask(previous) };
+
+    tokio::spawn(server.serve(listener, shutdown));
+
+    let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "the socket must be owner-only at creation even under a permissive umask"
+    );
+
+    let (code, _) = call(&socket, "GET", "/v1/version", None).await;
+    assert_eq!(code, 200);
+}
+
+/// A client that connects and never finishes sending its request headers must
+/// not pin a control-plane task open forever: the header-read timeout closes
+/// the stalled connection on its own (a residual DoS otherwise).
+#[tokio::test]
+async fn a_stalled_connection_is_closed_by_the_header_timeout() {
+    let dir = TempDir::new("idle");
+    let (socket, _shutdown) = serve(&dir, Reconciler::new()).await;
+
+    let mut stream = UnixStream::connect(&socket).await.expect("control socket is reachable");
+    // a request line but never the blank line that ends the headers, so the
+    // server is left waiting for the rest of the request
+    stream.write_all(b"GET /v1/version HTTP/1.1\r\n").await.unwrap();
+    stream.flush().await.unwrap();
+
+    // without the header-read timeout this read would block until the outer
+    // timeout trips; with it, the server closes the stalled connection itself
+    let mut buf = Vec::new();
+    let closed = timeout(Duration::from_secs(30), stream.read_to_end(&mut buf)).await;
+    assert!(
+        closed.is_ok(),
+        "a stalled connection must be closed by the header-read timeout, not held open forever"
+    );
+}
+
 /// Covers R30: a socket left behind by a crashed process is replaced, but a
 /// live one is never stolen.
 #[tokio::test]

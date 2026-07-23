@@ -9,11 +9,13 @@
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{UnixListener, UnixStream};
 
 use realm_core::lifecycle::{CancellationToken, ReconcileHandle};
@@ -24,6 +26,13 @@ use super::api::{ApiState, handle};
 
 /// Permissions of the socket and of a directory realm creates for it (R30).
 const OWNER_ONLY: u32 = 0o700;
+
+/// A connection that has not finished sending its request headers within this
+/// window is closed, so a client that connects and then stalls cannot pin a
+/// control-plane task open indefinitely (a residual DoS). The control socket is
+/// host-local, so anything this slow to send a few header bytes is broken; the
+/// bound is far tighter than hyper's WAN-oriented 30s default for that reason.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Make sure the directory holding the socket exists and is owner-only.
 ///
@@ -78,8 +87,22 @@ pub async fn bind(path: &Path) -> io::Result<UnixListener> {
         }
     }
 
-    let listener = UnixListener::bind(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(OWNER_ONLY))?;
+    // Create the socket owner-only from the outset. Its mode at creation is
+    // `0o777 & ~umask`, and a daemonized realm runs under `umask(0)`, so without
+    // this guard the socket is world-connectable in the window between `bind`
+    // and any later chmod. Force a `0o077` umask across the bind and restore the
+    // previous one immediately, so nothing else observes the tightened value.
+    let previous_umask = unsafe { libc::umask(0o077) };
+    let bound = UnixListener::bind(path);
+    unsafe { libc::umask(previous_umask) };
+    let listener = bound?;
+
+    // Apply the final mode on the listener's own file descriptor rather than by
+    // path: `fchmod` cannot be redirected through a symlink at `path` the way a
+    // path-based `set_permissions` can, and it needs no second lookup.
+    if unsafe { libc::fchmod(listener.as_raw_fd(), OWNER_ONLY as libc::mode_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
 
     log::info!("[control]listening on {:?}", path);
     Ok(listener)
@@ -111,6 +134,16 @@ impl ControlServer {
 
     /// Serve until `shutdown` fires, on an already bound listener.
     pub async fn serve(self, listener: UnixListener, shutdown: CancellationToken) {
+        // Accept errors must not spin the CPU. A transient (`ConnectionAborted`)
+        // retries immediately; a persistent error — fd exhaustion is the usual
+        // one — backs off exponentially up to a cap and resets on the next
+        // success, so the control plane recovers without busy-looping. Mirrors
+        // `realm_core::tcp::serve_tcp`, except the control plane is long-lived
+        // and never stops accepting.
+        const BACKOFF_MIN: Duration = Duration::from_millis(5);
+        const BACKOFF_MAX: Duration = Duration::from_millis(500);
+        let mut backoff = BACKOFF_MIN;
+
         loop {
             let accepted = tokio::select! {
                 biased;
@@ -119,9 +152,22 @@ impl ControlServer {
             };
 
             let (stream, _) = match accepted {
-                Ok(x) => x,
+                Ok(x) => {
+                    backoff = BACKOFF_MIN;
+                    x
+                }
+                Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                    log::warn!("[control]failed to accept: {}", e);
+                    continue;
+                }
                 Err(e) => {
-                    log::error!("[control]failed to accept: {}", e);
+                    log::error!("[control]failed to accept: {} (retrying in {:?})", e, backoff);
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
                     continue;
                 }
             };
@@ -133,7 +179,10 @@ impl ControlServer {
                 let io = TokioIo::new(stream);
                 let service = service_fn(move |req| handle(state.clone(), req));
 
-                let connection = http1::Builder::new().serve_connection(io, service);
+                let connection = http1::Builder::new()
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(HEADER_READ_TIMEOUT)
+                    .serve_connection(io, service);
                 tokio::pin!(connection);
 
                 tokio::select! {

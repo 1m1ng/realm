@@ -139,6 +139,10 @@ struct ProcessDto {
     pipe_page: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pre_conn_hook: Option<String>,
+    /// the tls backend this build was compiled with, so an agent can detect
+    /// provider drift (R35); frozen and compile-time
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls_provider: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -245,15 +249,16 @@ async fn reconcile(state: ApiState, req: Request<Incoming>) -> Response<BoxBody>
         }
     };
 
-    // audit trail: what was asked for, never how the transport is configured
-    // (which carries keys, passwords and certificate paths) (R12)
+    // audit trail: which id, and where traffic was pointed (listen -> remote),
+    // so a redirection leaves a trace. Never the transport parameters, which
+    // carry keys, passwords and certificate paths (R12).
     log::info!(
         "[control]reconcile generation {} with {} endpoints: {}",
         dto.generation,
         dto.endpoints.len(),
         dto.endpoints
             .iter()
-            .map(|e| format!("{}@{}", e.id, e.conf.listen))
+            .map(|e| format!("{}@{}->{}", e.id, e.conf.listen, e.conf.remote))
             .collect::<Vec<_>>()
             .join(", ")
     );
@@ -380,6 +385,20 @@ fn process_status() -> ProcessDto {
         nofile_hard: settings.nofile.map(|(_, hard)| hard),
         pipe_page: settings.pipe_page,
         pre_conn_hook: settings.pre_conn_hook,
+        tls_provider: tls_provider(),
+    }
+}
+
+/// The tls backend this build was compiled with, reported for drift detection
+/// (R35). A frozen, compile-time property, so it is read from the feature set
+/// rather than any runtime state.
+fn tls_provider() -> Option<&'static str> {
+    if cfg!(feature = "transport-tls-awslc") {
+        Some("aws-lc")
+    } else if cfg!(feature = "transport-tls-ring") {
+        Some("ring")
+    } else {
+        None
     }
 }
 
