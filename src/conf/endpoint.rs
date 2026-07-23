@@ -1,7 +1,9 @@
 use serde::{Serialize, Deserialize};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::time::Duration;
 
 use realm_core::endpoint::{Endpoint, RemoteAddr};
+use realm_core::lifecycle::{DrainPolicy, EndpointSource, EndpointSpec};
 
 #[cfg(feature = "balance")]
 use realm_core::balance::Balancer;
@@ -9,9 +11,9 @@ use realm_core::balance::Balancer;
 #[cfg(feature = "transport")]
 use realm_core::kaminari::mix::{MixAccept, MixConnect};
 
-use super::{Config, NetConf, NetInfo};
+use super::{BuildError, Config, NetConf, NetInfo};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointConf {
     pub listen: String,
 
@@ -45,63 +47,134 @@ pub struct EndpointConf {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_transport: Option<String>,
 
+    /// seconds established connections may keep running after this endpoint
+    /// was updated; absent means indefinitely, which is the contract's default
+    /// (R13, R17)
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_drain_timeout: Option<u64>,
+
+    /// seconds established connections may keep running after this endpoint
+    /// was deleted; absent means the 30s default (R15)
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_drain_timeout: Option<u64>,
+
     #[serde(default)]
     #[serde(skip_serializing_if = "Config::is_empty")]
     pub network: NetConf,
 }
 
 impl EndpointConf {
-    fn build_local(&self) -> SocketAddr {
+    fn build_local(&self) -> Result<SocketAddr, BuildError> {
         self.listen
             .to_socket_addrs()
-            .expect("invalid local address")
+            .map_err(|e| BuildError::new("listen", &self.listen, format!("cannot be resolved: {}", e)))?
             .next()
-            .unwrap()
+            .ok_or_else(|| BuildError::new("listen", &self.listen, "resolved to no address"))
     }
 
-    fn build_remote(&self) -> RemoteAddr {
-        Self::build_remote_x(&self.remote)
+    fn build_remote(&self) -> Result<RemoteAddr, BuildError> {
+        Self::build_remote_x("remote", &self.remote)
     }
 
-    fn build_remote_x(remote: &str) -> RemoteAddr {
+    fn build_remote_x(field: &'static str, remote: &str) -> Result<RemoteAddr, BuildError> {
         if let Ok(sockaddr) = remote.parse::<SocketAddr>() {
-            RemoteAddr::SocketAddr(sockaddr)
-        } else {
-            let mut iter = remote.rsplitn(2, ':');
-            let port = iter.next().unwrap().parse::<u16>().unwrap();
-            let addr = iter.next().unwrap().to_string();
-            RemoteAddr::DomainName(addr, port)
+            return Ok(RemoteAddr::SocketAddr(sockaddr));
         }
+
+        let Some((addr, port)) = remote.rsplit_once(':') else {
+            return Err(BuildError::new(field, remote, "missing `:port` suffix"));
+        };
+
+        let port = port
+            .parse::<u16>()
+            .map_err(|e| BuildError::new(field, remote, format!("invalid port: {}", e)))?;
+
+        if addr.is_empty() {
+            return Err(BuildError::new(field, remote, "missing host part"));
+        }
+
+        Ok(RemoteAddr::DomainName(addr.to_string(), port))
     }
 
-    fn build_send_through(&self) -> Option<SocketAddr> {
+    fn build_send_through(&self) -> Result<Option<SocketAddr>, BuildError> {
         let Self { through, .. } = self;
-        #[allow(clippy::question_mark)]
-        let through = match through {
-            Some(x) => x,
-            None => return None,
+        let Some(through) = through else {
+            return Ok(None);
         };
-        match through.to_socket_addrs() {
-            Ok(mut x) => Some(x.next().unwrap()),
-            Err(_) => {
-                let mut ipstr = String::from(through);
-                ipstr.retain(|c| c != '[' && c != ']');
-                ipstr.parse::<IpAddr>().map_or(None, |ip| Some(SocketAddr::new(ip, 0)))
+
+        if let Ok(mut addrs) = through.to_socket_addrs() {
+            if let Some(addr) = addrs.next() {
+                return Ok(Some(addr));
             }
         }
+
+        let mut ipstr = String::from(through);
+        ipstr.retain(|c| c != '[' && c != ']');
+        ipstr
+            .parse::<IpAddr>()
+            .map(|ip| Some(SocketAddr::new(ip, 0)))
+            .map_err(|e| BuildError::new("through", through, format!("neither an address nor an ip: {}", e)))
     }
 
     #[cfg(feature = "balance")]
-    fn build_balancer(&self) -> Balancer {
-        if let Some(s) = &self.balance {
-            Balancer::parse_from_str(s)
-        } else {
-            Balancer::default()
+    fn build_balancer(&self) -> Result<Balancer, BuildError> {
+        let Some(s) = &self.balance else {
+            return Ok(Balancer::default());
+        };
+
+        // `Balancer::parse_from_str` panics without the strategy separator
+        let Some((strategy, weights)) = s.split_once(':') else {
+            return Err(BuildError::new("balance", s, "expected `strategy: weight, ...`"));
+        };
+
+        // `realm_lb::Strategy::from` panics on anything but these; validate the
+        // token before `parse_from_str` reaches it, so a control-plane request
+        // cannot panic the reconciler (finding #2)
+        if !matches!(strategy.trim(), "off" | "iphash" | "roundrobin") {
+            return Err(BuildError::new(
+                "balance",
+                s,
+                format!(
+                    "unknown strategy `{}` (expected off, iphash or roundrobin)",
+                    strategy.trim()
+                ),
+            ));
         }
+
+        let balancer = Balancer::parse_from_str(s);
+
+        // a weight that failed to parse is silently dropped upstream: catch the
+        // mismatch here so that it cannot silently change the remote selection
+        let given = weights.trim();
+        let given = if given.is_empty() {
+            0
+        } else {
+            given.split(',').filter(|x| !x.trim().is_empty()).count()
+        };
+        if given != balancer.total() as usize {
+            return Err(BuildError::new("balance", s, "contains an invalid weight"));
+        }
+
+        if given != 0 && given != self.extra_remotes.len() + 1 {
+            return Err(BuildError::new(
+                "balance",
+                s,
+                format!(
+                    "expected {} weights for `remote` plus {} `extra_remotes`, got {}",
+                    self.extra_remotes.len() + 1,
+                    self.extra_remotes.len(),
+                    given
+                ),
+            ));
+        }
+
+        Ok(balancer)
     }
 
     #[cfg(feature = "transport")]
-    fn build_transport(&self) -> Option<(MixAccept, MixConnect)> {
+    fn build_transport(&self) -> Result<Option<(MixAccept, MixConnect)>, BuildError> {
         use realm_core::kaminari::mix::{MixClientConf, MixServerConf};
         use realm_core::kaminari::opt::get_ws_conf;
         use realm_core::kaminari::opt::get_tls_client_conf;
@@ -113,17 +186,42 @@ impl EndpointConf {
             ..
         } = self;
 
-        let listen_ws = listen_transport.as_ref().and_then(|s| get_ws_conf(s));
-        let listen_tls = listen_transport.as_ref().and_then(|s| get_tls_server_conf(s));
+        // kaminari's option parsers `panic!` on a malformed string (`get_ws_conf`
+        // when `ws` is present but host/path are missing, `get_tls_*_conf` when
+        // `tls` is present but sni/cert are missing). Since this runs on the
+        // reconciler task for a control-plane request, a panic would take the
+        // whole control plane down (finding #2) — so any panic is caught here
+        // and turned into a structured error naming the field.
+        fn guard<T>(field: &'static str, value: &Option<String>, f: impl FnOnce() -> T) -> Result<T, BuildError> {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|e| {
+                let reason = e
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| e.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| String::from("invalid transport options"));
+                BuildError::new(field, value.as_deref().unwrap_or_default(), reason)
+            })
+        }
 
-        let remote_ws = remote_transport.as_ref().and_then(|s| get_ws_conf(s));
-        let remote_tls = remote_transport.as_ref().and_then(|s| get_tls_client_conf(s));
+        let listen_ws = guard("listen_transport", listen_transport, || {
+            listen_transport.as_ref().and_then(|s| get_ws_conf(s))
+        })?;
+        let listen_tls = guard("listen_transport", listen_transport, || {
+            listen_transport.as_ref().and_then(|s| get_tls_server_conf(s))
+        })?;
+
+        let remote_ws = guard("remote_transport", remote_transport, || {
+            remote_transport.as_ref().and_then(|s| get_ws_conf(s))
+        })?;
+        let remote_tls = guard("remote_transport", remote_transport, || {
+            remote_transport.as_ref().and_then(|s| get_tls_client_conf(s))
+        })?;
 
         if matches!(
             (&listen_ws, &listen_tls, &remote_ws, &remote_tls),
             (None, None, None, None)
         ) {
-            None
+            Ok(None)
         } else {
             let ac = MixAccept::new_shared(MixServerConf {
                 ws: listen_ws,
@@ -133,7 +231,7 @@ impl EndpointConf {
                 ws: remote_ws,
                 tls: remote_tls,
             });
-            Some((ac, cc))
+            Ok(Some((ac, cc)))
         }
     }
 }
@@ -146,17 +244,26 @@ pub struct EndpointInfo {
 }
 
 impl Config for EndpointConf {
-    type Output = EndpointInfo;
+    type Output = Result<EndpointInfo, BuildError>;
 
     fn is_empty(&self) -> bool {
         false
     }
 
     fn build(self) -> Self::Output {
-        let laddr = self.build_local();
-        let raddr = self.build_remote();
+        let laddr = self.build_local()?;
+        let raddr = self.build_remote()?;
 
-        let extra_raddrs = self.extra_remotes.iter().map(|r| Self::build_remote_x(r)).collect();
+        let extra_raddrs = self
+            .extra_remotes
+            .iter()
+            .map(|r| Self::build_remote_x("extra_remotes", r))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let send_through = self.build_send_through()?;
+
+        #[cfg(feature = "balance")]
+        let balancer = self.build_balancer()?;
 
         // build partial conn_opts from netconf
         let NetInfo {
@@ -168,20 +275,20 @@ impl Config for EndpointConf {
 
         #[cfg(feature = "balance")]
         {
-            conn_opts.balancer = self.build_balancer();
+            conn_opts.balancer = balancer;
         }
 
         #[cfg(feature = "transport")]
         {
-            conn_opts.transport = self.build_transport();
+            conn_opts.transport = self.build_transport()?;
         }
 
         // build left fields of bind_opts and conn_opts
-        conn_opts.bind_address = self.build_send_through();
+        conn_opts.bind_address = send_through;
         conn_opts.bind_interface = self.interface;
         bind_opts.bind_interface = self.listen_interface;
 
-        EndpointInfo {
+        Ok(EndpointInfo {
             no_tcp,
             use_udp,
             endpoint: Endpoint {
@@ -191,7 +298,7 @@ impl Config for EndpointConf {
                 conn_opts,
                 extra_raddrs,
             },
-        }
+        })
     }
 
     fn rst_field(&mut self, _: &Self) -> &mut Self {
@@ -203,8 +310,9 @@ impl Config for EndpointConf {
     }
 
     fn from_cmd_args(matches: &clap::ArgMatches) -> Self {
-        let listen = matches.get_one("local").cloned().unwrap();
-        let remote = matches.get_one("remote").cloned().unwrap();
+        // both are guaranteed present by the caller (`cmd::handle_matches`)
+        let listen = matches.get_one("local").cloned().unwrap_or_default();
+        let remote = matches.get_one("remote").cloned().unwrap_or_default();
         let through = matches.get_one("through").cloned();
         let interface = matches.get_one("interface").cloned();
         let listen_interface = matches.get_one("listen_interface").cloned();
@@ -222,6 +330,48 @@ impl Config for EndpointConf {
             network: Default::default(),
             extra_remotes: Vec::new(),
             balance: None,
+            update_drain_timeout: None,
+            delete_drain_timeout: None,
         }
+    }
+}
+
+impl EndpointConf {
+    /// Canonical form used for diffing (KTD3).
+    ///
+    /// Fills in the process-wide network options the same way the static mode
+    /// does, so that two descriptions meaning the same thing compare equal and
+    /// an agent's first equivalent submission is `unchanged`, not a rebuild.
+    pub fn normalized(&self, global: &NetConf) -> Self {
+        let mut conf = self.clone();
+        conf.network.take_field(global);
+        conf
+    }
+
+    /// Drain deadlines this endpoint overrides, if any (R13, R15).
+    fn drain_policy(&self) -> Option<DrainPolicy> {
+        if self.update_drain_timeout.is_none() && self.delete_drain_timeout.is_none() {
+            return None;
+        }
+
+        let default = DrainPolicy::default();
+        Some(DrainPolicy {
+            on_update: self.update_drain_timeout.map(Duration::from_secs).or(default.on_update),
+            on_delete: self.delete_drain_timeout.map(Duration::from_secs).or(default.on_delete),
+        })
+    }
+}
+
+impl EndpointSource for EndpointConf {
+    fn build(&self) -> Result<EndpointSpec, String> {
+        let drain = self.drain_policy();
+        let info = Config::build(self.clone()).map_err(|e| e.to_string())?;
+
+        Ok(EndpointSpec {
+            endpoint: info.endpoint,
+            tcp: !info.no_tcp,
+            udp: info.use_udp,
+            drain,
+        })
     }
 }

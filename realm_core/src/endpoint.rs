@@ -72,6 +72,44 @@ pub struct Endpoint {
     pub extra_raddrs: Vec<RemoteAddr>,
 }
 
+/// Immutable per-generation runtime configuration of a tcp data plane.
+///
+/// A connection captures an `Arc` of this at accept time and keeps using it
+/// until it ends, so later changes to the endpoint cannot affect a connection
+/// that is already running.
+#[derive(Debug, Clone)]
+pub struct TcpRuntime {
+    pub raddr: RemoteAddr,
+    pub conn_opts: ConnectOpts,
+    pub extra_raddrs: Vec<RemoteAddr>,
+}
+
+/// Immutable per-generation runtime configuration of a udp data plane.
+#[derive(Debug, Clone)]
+pub struct UdpRuntime {
+    pub raddr: RemoteAddr,
+    pub conn_opts: ConnectOpts,
+}
+
+impl Endpoint {
+    /// Split off the parts a tcp data plane needs at runtime.
+    pub fn tcp_runtime(&self) -> TcpRuntime {
+        TcpRuntime {
+            raddr: self.raddr.clone(),
+            conn_opts: self.conn_opts.clone(),
+            extra_raddrs: self.extra_raddrs.clone(),
+        }
+    }
+
+    /// Split off the parts a udp data plane needs at runtime.
+    pub fn udp_runtime(&self) -> UdpRuntime {
+        UdpRuntime {
+            raddr: self.raddr.clone(),
+            conn_opts: self.conn_opts.clone(),
+        }
+    }
+}
+
 // display impl below
 
 impl Display for RemoteAddr {

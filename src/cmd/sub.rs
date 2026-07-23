@@ -31,7 +31,13 @@ pub fn handle_convert(matches: &ArgMatches) {
     let old = fs::read(old).unwrap();
 
     let data: LegacyConf = serde_json::from_slice(&old).unwrap();
-    let data: FullConf = data.into();
+    let data: FullConf = match FullConf::try_from(data) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("realm: {}", e);
+            std::process::exit(1)
+        }
+    };
 
     let data = match matches.get_one::<String>("type").unwrap().as_str() {
         "toml" => toml::to_string(&data).unwrap(),

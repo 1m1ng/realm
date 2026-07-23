@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Command, ArgMatches};
 
 use realm_core::realm_io;
@@ -13,10 +15,34 @@ use crate::consts::FEATURES;
 mod sub;
 mod flag;
 
+/// Control-plane options, given on the command line.
+///
+/// Absent means no control plane at all: the process then behaves exactly like
+/// upstream realm (KTD7).
+#[derive(Debug, Default, Clone)]
+pub struct ControlOpts {
+    pub socket: Option<PathBuf>,
+    pub state_file: Option<PathBuf>,
+}
+
+impl ControlOpts {
+    /// Where to keep the last-known-good state: next to the control socket
+    /// unless another path was given.
+    pub fn state_file(&self) -> Option<PathBuf> {
+        if let Some(path) = &self.state_file {
+            return Some(path.clone());
+        }
+
+        let socket = self.socket.as_ref()?;
+        let dir = socket.parent()?;
+        Some(dir.join("realm-state.json"))
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum CmdInput {
-    Config(String, CmdOverride),
-    Endpoint(EndpointConf, CmdOverride),
+    Config(String, CmdOverride, ControlOpts),
+    Endpoint(EndpointConf, CmdOverride, ControlOpts),
     None,
 }
 
@@ -87,6 +113,7 @@ fn handle_matches(matches: ArgMatches) -> CmdInput {
         // get
         if let Ok((soft, hard)) = get_nofile_limit() {
             println!("fd: soft={}, hard={}", soft, hard);
+            crate::process::amend(|s| s.nofile = Some((soft, hard)));
         }
     }
 
@@ -98,6 +125,7 @@ fn handle_matches(matches: ArgMatches) -> CmdInput {
             if let Ok(page) = page.parse::<usize>() {
                 set_pipe_size(page * 0x1000);
                 println!("pipe capacity: {}", page * 0x1000);
+                crate::process::amend(|s| s.pipe_page = Some(page));
             } else {
                 eprintln!("invalid page value: {}", page);
             }
@@ -110,18 +138,20 @@ fn handle_matches(matches: ArgMatches) -> CmdInput {
         if let Some(path) = matches.get_one::<String>("pre_conn_hook") {
             load_pre_conn(path);
             println!("hook: {}", path);
+            crate::process::amend(|s| s.pre_conn_hook = Some(path.clone()));
         }
     }
 
     let opts = parse_global_opts(&matches);
+    let control = parse_control_opts(&matches);
 
     if let Some(config) = matches.get_one("config").cloned() {
-        return CmdInput::Config(config, opts);
+        return CmdInput::Config(config, opts, control);
     }
 
     if matches.contains_id("local") && matches.contains_id("remote") {
         let ep = EndpointConf::from_cmd_args(&matches);
-        return CmdInput::Endpoint(ep, opts);
+        return CmdInput::Endpoint(ep, opts, control);
     }
 
     CmdInput::None
@@ -132,4 +162,12 @@ fn parse_global_opts(matches: &ArgMatches) -> CmdOverride {
     let dns = DnsConf::from_cmd_args(matches);
     let network = NetConf::from_cmd_args(matches);
     CmdOverride { log, dns, network }
+}
+
+/// Control-plane options from the command line.
+pub fn parse_control_opts(matches: &ArgMatches) -> ControlOpts {
+    ControlOpts {
+        socket: matches.get_one::<String>("control_socket").map(PathBuf::from),
+        state_file: matches.get_one::<String>("state_file").map(PathBuf::from),
+    }
 }

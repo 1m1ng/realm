@@ -1,2 +1,3 @@
 [toolchain]
-channel = "nightly"
+# pinned for reproducible builds; bump deliberately after verifying the full CI matrix
+channel = "nightly-2026-07-22"

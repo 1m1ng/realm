@@ -6,13 +6,13 @@ use tokio::net::UdpSocket;
 use super::SockMap;
 use super::{socket, batched};
 
-use crate::trick::Ref;
 use crate::time::timeoutfut;
 use crate::dns::resolve_addr;
-use crate::endpoint::{RemoteAddr, ConnectOpts};
+use crate::endpoint::UdpRuntime;
+use crate::lifecycle::{CohortHandle, ConnGuard};
 
 use batched::{Packet, SockAddrStore};
-use registry::Registry;
+pub(super) use registry::Registry;
 mod registry {
     use super::*;
     type Range = std::ops::Range<u16>;
@@ -106,48 +106,85 @@ mod registry {
     }
 }
 
+/// Receive a batch of datagrams from the entry socket and forward them,
+/// creating the association tasks that route the answers back.
+///
+/// The `registry` is owned by the caller's receive loop and reused across
+/// batches: `batched_recv_on` overwrites its cursor with the new count and
+/// `group_by_addr` regroups only that prefix, so nothing from a prior batch
+/// is reprocessed. Allocating it once per socket (rather than once per batch)
+/// keeps the ~205 KiB packet buffer off the hot path.
+///
+/// Everything an association needs is handed to it as an owned `Arc`, so it
+/// stays valid even after this loop — and the endpoint generation it belongs
+/// to — is gone.
 pub async fn associate_and_relay(
-    lis: Ref<UdpSocket>,
-    rname: Ref<RemoteAddr>,
-    conn_opts: Ref<ConnectOpts>,
-    sockmap: Ref<SockMap>,
+    lis: &Arc<UdpSocket>,
+    runtime: &Arc<UdpRuntime>,
+    sockmap: &Arc<SockMap>,
+    cohort: &CohortHandle,
+    registry: &mut Registry,
 ) -> Result<()> {
-    let mut registry = Registry::new(batched::MAX_PACKETS);
+    registry.batched_recv_on(lis).await?;
+    log::debug!("[udp]entry batched recvfrom[{}]", registry.count());
 
-    loop {
-        registry.batched_recv_on(&lis).await?;
-        log::debug!("[udp]entry batched recvfrom[{}]", registry.count());
-        let raddr = resolve_addr(&rname).await?.iter().next().unwrap();
-        log::debug!("[udp]{} resolved as {}", *rname, raddr);
+    let raddr = resolve_addr(&runtime.raddr)
+        .await?
+        .iter()
+        .next()
+        .ok_or_else(|| std::io::Error::other(format!("{} resolved to no address", runtime.raddr)))?;
+    log::debug!("[udp]{} resolved as {}", runtime.raddr, raddr);
 
-        registry.group_by_addr();
-        for pkts in registry.group_iter() {
-            let laddr = pkts[0].addr.clone().into();
-            let rsock = sockmap.find_or_insert(&laddr, || {
-                let s = Arc::new(socket::associate(&raddr, &conn_opts)?);
-                tokio::spawn(send_back(lis, laddr, s.clone(), conn_opts, sockmap));
-                log::info!("[udp]new association {} => {} as {}", laddr, *rname, raddr);
-                Result::Ok(s)
-            })?;
-            let raddr: SockAddrStore = raddr.into();
-            batched::send_all(&rsock, pkts.iter().map(|x| x.ref_with_addr(&raddr))).await?;
-        }
+    registry.group_by_addr();
+    for pkts in registry.group_iter() {
+        let laddr = pkts[0].addr.clone().into();
+        let rsock = sockmap.find_or_insert(&laddr, || {
+            let s = Arc::new(socket::associate(&raddr, &runtime.conn_opts)?);
+            tokio::spawn(send_back(
+                Arc::clone(lis),
+                laddr,
+                Arc::clone(&s),
+                Arc::clone(runtime),
+                Arc::clone(sockmap),
+                cohort.register(),
+            ));
+            log::info!("[udp]new association {} => {} as {}", laddr, runtime.raddr, raddr);
+            Result::Ok(s)
+        })?;
+        let raddr: SockAddrStore = raddr.into();
+        batched::send_all(&rsock, pkts.iter().map(|x| x.ref_with_addr(&raddr))).await?;
     }
+
+    Ok(())
 }
 
+/// Route answers of one association back to the client.
+///
+/// This task can outlive the receive loop that spawned it, so it observes
+/// cancellation itself instead of relying on a parent task going away.
 async fn send_back(
-    lsock: Ref<UdpSocket>,
+    lsock: Arc<UdpSocket>,
     laddr: SocketAddr,
     rsock: Arc<UdpSocket>,
-    conn_opts: Ref<ConnectOpts>,
-    sockmap: Ref<SockMap>,
+    runtime: Arc<UdpRuntime>,
+    sockmap: Arc<SockMap>,
+    guard: ConnGuard,
 ) {
     let mut registry = Registry::new(batched::MAX_PACKETS);
-    let timeout = conn_opts.associate_timeout;
+    let timeout = runtime.conn_opts.associate_timeout;
     let laddr_s: SockAddrStore = laddr.into();
 
     loop {
-        match timeoutfut(registry.batched_recv_on(&rsock), timeout).await {
+        let received = tokio::select! {
+            biased;
+            _ = guard.token().cancelled() => {
+                log::debug!("[udp]association for {} cancelled", laddr);
+                break;
+            }
+            res = timeoutfut(registry.batched_recv_on(&rsock), timeout) => res,
+        };
+
+        match received {
             Err(_) => {
                 log::debug!("[udp]rear recvfrom timeout");
                 break;
@@ -162,7 +199,17 @@ async fn send_back(
         };
 
         let pkts = registry.iter().map(|pkt| pkt.ref_with_addr(&laddr_s));
-        if let Err(e) = batched::send_all(&lsock, pkts).await {
+
+        let sent = tokio::select! {
+            biased;
+            _ = guard.token().cancelled() => {
+                log::debug!("[udp]association for {} cancelled", laddr);
+                break;
+            }
+            res = batched::send_all(&lsock, pkts) => res,
+        };
+
+        if let Err(e) = sent {
             log::error!("[udp]failed to sendto client{}: {}", &laddr, e);
             break;
         }
@@ -170,4 +217,8 @@ async fn send_back(
 
     sockmap.remove(&laddr);
     log::debug!("[udp]remove association for {}", &laddr);
+
+    // released last: the cohort reports this association as gone only once the
+    // task has actually finished and its socket is about to be dropped
+    drop(guard);
 }

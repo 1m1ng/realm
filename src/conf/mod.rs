@@ -20,6 +20,45 @@ pub use endpoint::{EndpointConf, EndpointInfo};
 mod legacy;
 pub use legacy::LegacyConf;
 
+/// Structured configuration error.
+///
+/// Building a runtime object out of user input never panics: every rejection
+/// names the offending field so that both the CLI and the control plane can
+/// report which part of the configuration is wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildError {
+    /// name of the offending configuration field
+    pub field: &'static str,
+    /// offending value, as written in the configuration
+    pub value: String,
+    /// why the value was rejected
+    pub reason: String,
+}
+
+impl BuildError {
+    pub fn new(field: &'static str, value: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            field,
+            value: value.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid `{}` = `{}`: {}", self.field, self.value, self.reason)
+    }
+}
+
+impl std::error::Error for BuildError {}
+
+impl From<BuildError> for Error {
+    fn from(e: BuildError) -> Self {
+        Error::other(e.to_string())
+    }
+}
+
 #[allow(clippy::too_long_first_doc_paragraph)]
 /// Conig Architecture
 /// cmd | file => LogConf => { level, output }
@@ -80,15 +119,12 @@ impl FullConf {
         }
     }
 
-    pub fn from_conf_file(file: &str) -> Self {
-        let mtd = fs::metadata(file).unwrap_or_else(|e| panic!("failed to open {}: {}", file, e));
+    pub fn from_conf_file(file: &str) -> Result<Self> {
+        let mtd = fs::metadata(file).map_err(|e| Error::other(format!("failed to open {}: {}", file, e)))?;
 
         if mtd.is_file() {
-            let conf = fs::read_to_string(file).unwrap_or_else(|e| panic!("failed to open {}: {}", file, e));
-            match Self::from_conf_str(&conf) {
-                Ok(x) => return x,
-                Err(e) => panic!("failed to parse {}: {}", file, &e),
-            }
+            let conf = fs::read_to_string(file).map_err(|e| Error::other(format!("failed to open {}: {}", file, e)))?;
+            return Self::from_conf_str(&conf).map_err(|e| Error::other(format!("failed to parse {}: {}", file, e)));
         }
 
         let mut full_conf = FullConf::default();
@@ -100,14 +136,16 @@ impl FullConf {
             .filter(|e| e.file_type().is_file())
             .filter(|e| e.path().extension().is_some_and(|s| s == "toml" || s == "json"))
         {
+            let path = entry.path().to_string_lossy().into_owned();
+
             let conf_part = fs::read_to_string(entry.path())
-                .unwrap_or_else(|e| panic!("failed to open {}: {}", entry.path().to_string_lossy(), e));
+                .map_err(|e| Error::other(format!("failed to open {}: {}", path, e)))?;
 
             let conf_part = Self::from_conf_str(&conf_part)
-                .unwrap_or_else(|e| panic!("failed to parse {}: {}", entry.path().to_string_lossy(), e));
+                .map_err(|e| Error::other(format!("failed to parse {}: {}", path, e)))?;
             full_conf.take_fields(conf_part);
         }
-        full_conf
+        Ok(full_conf)
     }
 
     pub fn from_conf_str(s: &str) -> Result<Self> {
@@ -125,7 +163,7 @@ impl FullConf {
         let legacy_err = match serde_json::from_str::<LegacyConf>(s) {
             Ok(x) => {
                 eprintln!("attention: you are using a legacy config file!");
-                return Ok(x.into());
+                return FullConf::try_from(x).map_err(Error::from);
             }
             Err(e) => e,
         };

@@ -1,4 +1,6 @@
 use std::io::Result;
+use std::sync::Arc;
+
 use tokio::net::TcpStream;
 
 use super::socket;
@@ -13,15 +15,19 @@ use super::proxy;
 #[cfg(feature = "transport")]
 use super::transport;
 
-use crate::trick::Ref;
-use crate::endpoint::{RemoteAddr, ConnectOpts};
+use crate::endpoint::{ConnectOpts, TcpRuntime};
+
+/// Connect to the remote peer and relay, using configuration this connection
+/// owns: the `Arc` keeps the generation it was accepted under alive for as
+/// long as the connection runs, independently of the listener.
 #[allow(unused)]
-pub async fn connect_and_relay(
-    mut local: TcpStream,
-    raddr: Ref<RemoteAddr>,
-    conn_opts: Ref<ConnectOpts>,
-    extra_raddrs: Ref<Vec<RemoteAddr>>,
-) -> Result<()> {
+pub async fn connect_and_relay(mut local: TcpStream, runtime: Arc<TcpRuntime>) -> Result<()> {
+    let TcpRuntime {
+        raddr,
+        conn_opts,
+        extra_raddrs,
+    } = runtime.as_ref();
+
     let ConnectOpts {
         #[cfg(feature = "proxy")]
         proxy_opts,
@@ -34,7 +40,7 @@ pub async fn connect_and_relay(
 
         tcp_keepalive,
         ..
-    } = conn_opts.as_ref();
+    } = conn_opts;
 
     // before connect:
     // - pre-connect hook
@@ -46,13 +52,13 @@ pub async fn connect_and_relay(
             // accept or deny connection.
             #[cfg(feature = "balance")]
             {
-                hook::pre_connect_hook(&mut local, raddr.as_ref(), extra_raddrs.as_ref()).await?;
+                hook::pre_connect_hook(&mut local, raddr, extra_raddrs).await?;
             }
 
             // accept or deny connection, or select a remote peer.
             #[cfg(not(feature = "balance"))]
             {
-                hook::pre_connect_hook(&mut local, raddr.as_ref(), extra_raddrs.as_ref()).await?
+                hook::pre_connect_hook(&mut local, raddr, extra_raddrs).await?
             }
         }
 
@@ -64,17 +70,19 @@ pub async fn connect_and_relay(
             });
             log::debug!("[tcp]select remote peer, token: {:?}", token);
             match token {
-                None | Some(Token(0)) => raddr.as_ref(),
-                Some(Token(idx)) => &extra_raddrs.as_ref()[idx as usize - 1],
+                None | Some(Token(0)) => raddr,
+                Some(Token(idx)) => extra_raddrs
+                    .get(idx as usize - 1)
+                    .ok_or_else(|| std::io::Error::other("balancer selected an unknown remote"))?,
             }
         }
 
         #[cfg(not(any(feature = "hook", feature = "balance")))]
-        raddr.as_ref()
+        raddr
     };
 
     // connect!
-    let mut remote = socket::connect(raddr, conn_opts.as_ref()).await?;
+    let mut remote = socket::connect(raddr, conn_opts).await?;
     log::info!("[tcp]{} => {} as {}", local.peer_addr()?, raddr, remote.peer_addr()?);
 
     // after connected

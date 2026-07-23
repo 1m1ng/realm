@@ -1,7 +1,7 @@
 use std::fmt::{Formatter, Display};
 use serde::{Serialize, Deserialize};
 use log::LevelFilter;
-use super::Config;
+use super::{BuildError, Config};
 use crate::consts::DEFAULT_LOG_FILE;
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, Copy)]
@@ -72,7 +72,7 @@ pub struct LogConf {
 }
 
 impl Config for LogConf {
-    type Output = (LevelFilter, fern::Output);
+    type Output = Result<(LevelFilter, fern::Output), BuildError>;
 
     fn is_empty(&self) -> bool {
         crate::empty![self => level, output]
@@ -92,11 +92,11 @@ impl Config for LogConf {
                 .append(true)
                 .create(true)
                 .open(output)
-                .unwrap_or_else(|e| panic!("failed to open {}: {}", output, &e))
+                .map_err(|e| BuildError::new("log.output", output, format!("cannot be opened: {}", e)))?
                 .into(),
         };
 
-        (level.into(), output)
+        Ok((level.into(), output))
     }
 
     fn rst_field(&mut self, other: &Self) -> &mut Self {
