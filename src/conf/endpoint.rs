@@ -1,7 +1,9 @@
 use serde::{Serialize, Deserialize};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::time::Duration;
 
 use realm_core::endpoint::{Endpoint, RemoteAddr};
+use realm_core::lifecycle::{DrainPolicy, EndpointSource, EndpointSpec};
 
 #[cfg(feature = "balance")]
 use realm_core::balance::Balancer;
@@ -11,7 +13,7 @@ use realm_core::kaminari::mix::{MixAccept, MixConnect};
 
 use super::{BuildError, Config, NetConf, NetInfo};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointConf {
     pub listen: String,
 
@@ -44,6 +46,19 @@ pub struct EndpointConf {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_transport: Option<String>,
+
+    /// seconds established connections may keep running after this endpoint
+    /// was updated; absent means indefinitely, which is the contract's default
+    /// (R13, R17)
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_drain_timeout: Option<u64>,
+
+    /// seconds established connections may keep running after this endpoint
+    /// was deleted; absent means the 30s default (R15)
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_drain_timeout: Option<u64>,
 
     #[serde(default)]
     #[serde(skip_serializing_if = "Config::is_empty")]
@@ -276,6 +291,48 @@ impl Config for EndpointConf {
             network: Default::default(),
             extra_remotes: Vec::new(),
             balance: None,
+            update_drain_timeout: None,
+            delete_drain_timeout: None,
         }
+    }
+}
+
+impl EndpointConf {
+    /// Canonical form used for diffing (KTD3).
+    ///
+    /// Fills in the process-wide network options the same way the static mode
+    /// does, so that two descriptions meaning the same thing compare equal and
+    /// an agent's first equivalent submission is `unchanged`, not a rebuild.
+    pub fn normalized(&self, global: &NetConf) -> Self {
+        let mut conf = self.clone();
+        conf.network.take_field(global);
+        conf
+    }
+
+    /// Drain deadlines this endpoint overrides, if any (R13, R15).
+    fn drain_policy(&self) -> Option<DrainPolicy> {
+        if self.update_drain_timeout.is_none() && self.delete_drain_timeout.is_none() {
+            return None;
+        }
+
+        let default = DrainPolicy::default();
+        Some(DrainPolicy {
+            on_update: self.update_drain_timeout.map(Duration::from_secs).or(default.on_update),
+            on_delete: self.delete_drain_timeout.map(Duration::from_secs).or(default.on_delete),
+        })
+    }
+}
+
+impl EndpointSource for EndpointConf {
+    fn build(&self) -> Result<EndpointSpec, String> {
+        let drain = self.drain_policy();
+        let info = Config::build(self.clone()).map_err(|e| e.to_string())?;
+
+        Ok(EndpointSpec {
+            endpoint: info.endpoint,
+            tcp: !info.no_tcp,
+            udp: info.use_udp,
+            drain,
+        })
     }
 }

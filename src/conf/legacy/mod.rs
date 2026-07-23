@@ -105,6 +105,8 @@ impl TryFrom<LegacyConf> for FullConf {
                 network: Default::default(),
                 extra_remotes: Vec::new(),
                 balance: None,
+                update_drain_timeout: None,
+                delete_drain_timeout: None,
             })
             .collect();
 
