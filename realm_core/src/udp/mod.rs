@@ -15,7 +15,7 @@ use crate::endpoint::{BindOpts, Endpoint, UdpRuntime};
 use crate::lifecycle::{CancellationToken, Cohort, CohortHandle};
 
 use sockmap::SockMap;
-use middle::associate_and_relay;
+use middle::{associate_and_relay, Registry};
 
 /// Bind a udp socket, reporting failures instead of aborting.
 pub fn bind_udp(laddr: &SocketAddr, bind_opts: BindOpts) -> Result<UdpSocket> {
@@ -57,6 +57,10 @@ pub async fn serve_udp(
     let lis = Arc::new(lis);
     let sockmap = Arc::new(SockMap::new());
 
+    // Allocated once per socket and reused across batches: the entry receive
+    // buffer (~205 KiB) must not be reallocated on every wakeup of the loop.
+    let mut registry = Registry::new(batched::MAX_PACKETS);
+
     loop {
         let relayed = tokio::select! {
             biased;
@@ -64,7 +68,7 @@ pub async fn serve_udp(
                 log::debug!("[udp]stop receiving on {:?}", lis.local_addr());
                 break;
             }
-            res = associate_and_relay(&lis, &runtime, &sockmap, &cohort) => res,
+            res = associate_and_relay(&lis, &runtime, &sockmap, &cohort, &mut registry) => res,
         };
 
         if let Err(e) = relayed {
