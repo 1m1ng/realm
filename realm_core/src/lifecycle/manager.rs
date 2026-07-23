@@ -529,7 +529,18 @@ impl EndpointManager {
         if same_address {
             // the address is occupied by ourselves: stop accepting and wait for
             // the socket to be released before rebinding it
-            let cohort = stop_active(active).await;
+            let mut cohort = stop_active(active).await;
+
+            // A udp association holds a clone of the entry socket, so joining the
+            // receive loop does not free the address on its own — the
+            // associations must exit too. R16 rebuilds udp associations on a
+            // change, so cancel them and wait before rebinding the same address.
+            // (On Linux SO_REUSEADDR masks the lingering socket; on macOS/BSD the
+            // rebind fails with EADDRINUSE.)
+            if proto == Proto::Udp {
+                cohort.cancel();
+                cohort.wait_drained().await;
+            }
 
             match start(spec, proto, generation).await {
                 Ok(new_active) => {
