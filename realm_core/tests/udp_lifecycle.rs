@@ -15,7 +15,7 @@ use realm_core::lifecycle::{CancellationToken, Cohort};
 use realm_core::udp::{bind_udp, serve_udp};
 
 mod common;
-use common::{open_fds, spawn_udp_echo};
+use common::spawn_udp_echo;
 
 /// Send a datagram through the relay and assert the echo comes back intact.
 async fn roundtrip(client: &UdpSocket, relay: std::net::SocketAddr, payload: &[u8]) {
@@ -49,9 +49,6 @@ async fn stopping_an_endpoint_terminates_all_associations() {
     let shutdown = CancellationToken::new();
     let serving = tokio::spawn(serve_udp(lis, runtime_for(echo), cohort.handle(), shutdown.clone()));
 
-    #[cfg(target_os = "linux")]
-    let fds_before = open_fds();
-
     let mut clients = Vec::new();
     for _ in 0..4 {
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -72,19 +69,12 @@ async fn stopping_an_endpoint_terminates_all_associations() {
     timeout(Duration::from_secs(5), cohort.wait_drained())
         .await
         .expect("associations must actually exit");
+    // the count reaching zero means every association task actually returned
+    // and released its guard — and with it the last reference to its outbound
+    // socket. Descriptor-level leak detection lives in `stress.rs`, which runs
+    // alone in its own process: a process-wide fd count cannot tell this test's
+    // sockets from those of the tests running next to it.
     assert_eq!(cohort.count(), 0, "association count drops monotonically to zero");
-
-    #[cfg(target_os = "linux")]
-    {
-        // outbound sockets are closed again; allow slack for runtime internals
-        let fds_after = open_fds();
-        assert!(
-            fds_after <= fds_before + 1,
-            "outbound sockets leaked: {} -> {}",
-            fds_before,
-            fds_after
-        );
-    }
 }
 
 /// Covers R16: after a controlled rebuild the client's next datagram creates a
