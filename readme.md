@@ -81,12 +81,13 @@ The `realm` binary will be available in `target/release`.
 - transport-tls-ring: use [ring](https://github.com/briansmith/ring) as rustls backend.
 - transport-tls-awslc: use [aws-lc](https://github.com/aws/aws-lc-rs) as rustls backend.
 - batched-udp: enable more efficient udp on linux.
+- control: enable the unix-socket control plane (fork only, see [docs/control-api.md](docs/control-api.md)).
 - multi-thread: enable tokio's multi-threaded IO scheduler.
 - mi-malloc: custom memory allocator.
 - jemalloc: custom memory allocator.
 - page-alloc: custom memory allocator.
 
-Default: proxy + balance + transport + transport-tls-awslc + batched-udp + brutal-shutdown + multi-thread.
+Default: proxy + balance + transport + transport-tls-awslc + batched-udp + brutal-shutdown + multi-thread + control.
 
 Deafult-Slim: batched-udp + brutal-shutdown + multi-thread.
 
