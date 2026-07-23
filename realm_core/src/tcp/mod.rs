@@ -98,14 +98,13 @@ pub async fn serve_tcp(
         let guard = cohort.register();
 
         tokio::spawn(async move {
-            let raddr = runtime.raddr.clone();
             tokio::select! {
                 _ = guard.token().cancelled() => {
-                    log::debug!("[tcp]{} => {}, cancelled", addr, raddr);
+                    log::debug!("[tcp]{} => {}, cancelled", addr, runtime.raddr);
                 }
                 res = connect_and_relay(local, Arc::clone(&runtime)) => match res {
-                    Ok(..) => log::debug!("[tcp]{} => {}, finish", addr, raddr),
-                    Err(e) => log::error!("[tcp]{} => {}, error: {}", addr, raddr, e),
+                    Ok(..) => log::debug!("[tcp]{} => {}, finish", addr, runtime.raddr),
+                    Err(e) => log::error!("[tcp]{} => {}, error: {}", addr, runtime.raddr, e),
                 },
             }
             // the guard is released here, and only here: the cohort reports
