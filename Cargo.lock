@@ -1645,6 +1645,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jemallocator",
+ "libc",
  "log",
  "mimalloc",
  "mmap-allocator",
@@ -1658,7 +1659,7 @@ dependencies = [
 
 [[package]]
 name = "realm_core"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "env_logger",

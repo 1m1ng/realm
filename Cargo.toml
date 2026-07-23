@@ -51,6 +51,7 @@ serde_json = "1"
 hyper = { version = "1", features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
+libc = { version = "0.2", optional = true }
 
 # malloc
 mimalloc = { version = "0.1", optional = true, default-features = false }
@@ -72,7 +73,7 @@ default-ring = ["proxy", "balance", "multi-thread", "transport", "transport-tls-
 default-slim = ["multi-thread", "batched-udp", "brutal-shutdown"]
 
 # unix domain socket control plane: reconcile / status / readiness / version
-control = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "tokio/net", "tokio/sync", "tokio/macros", "tokio/io-util"]
+control = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:libc", "tokio/net", "tokio/sync", "tokio/macros", "tokio/io-util"]
 
 hook = ["realm_core/hook"]
 proxy = ["realm_core/proxy"]
