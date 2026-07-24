@@ -16,11 +16,13 @@ jobs:
       matrix:
         target:
           # cross
-          - x86_64-unknown-linux-gnu
+          # NOTE: x86_64/aarch64 linux-gnu are intentionally omitted. cross's
+          # default gnu images link a newer glibc (>=2.38) than Debian 12
+          # (2.36) / Ubuntu 22.04 (2.35) ship, so those binaries fail to start
+          # on the fleet. The static musl siblings run everywhere; ship those.
           - x86_64-unknown-linux-musl
           - x86_64-pc-windows-gnu
           - x86_64-linux-android
-          - aarch64-unknown-linux-gnu
           - aarch64-unknown-linux-musl
           - aarch64-linux-android
           - arm-unknown-linux-gnueabi
