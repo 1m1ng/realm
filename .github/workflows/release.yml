@@ -13,6 +13,10 @@ jobs:
         'ubuntu-22.04'
       }}
     strategy:
+      # Don't let one target's failure cancel the rest -- each target uploads
+      # its own release assets, so a musl build should still publish even if an
+      # exotic target (mips/arm/...) fails to build.
+      fail-fast: false
       matrix:
         target:
           # cross

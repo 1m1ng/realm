@@ -74,19 +74,20 @@ runs:
 
     - name: install cross-rs
       if: ${{ inputs.cross == 'true' }}
-      # Fetch the prebuilt cross binary instead of `cargo install --git`.
+      # Build cross from git: its main branch supports the array form of
+      # `build-std` in Cross.toml that the mips targets rely on; the last
+      # published release (v0.2.5) only accepts a boolean and rejects the file
+      # ("invalid type: sequence, expected a boolean"), which breaks every
+      # cross-driven target, not just mips.
+      #
       # cross's source uses `eyre::bail!` in expression position, which the
-      # pinned nightly promotes from a future-incompat warning to a hard error
-      # ("trailing semicolon in macro used in expression position"), so building
-      # cross from source fails. The prebuilt static-musl binary needs no
-      # compilation; cross still runs the actual cross-compile inside its docker
-      # image using the pinned toolchain. Pinned to a release for reproducibility.
+      # pinned nightly reports as an error -- "trailing semicolon in macro used
+      # in expression position", a future-incompat lint escalated to deny. That
+      # made `cargo install cross` fail to compile. `--cap-lints warn` downgrades
+      # it back to a warning so cross builds; verified against nightly-2026-07-22.
       run: |
         if [ ! -f ~/.cargo/bin/cross ]; then
-          mkdir -p ~/.cargo/bin
-          curl --proto '=https' --tlsv1.2 -fsSL \
-            "https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-musl.tar.gz" \
-            | tar -xz -C ~/.cargo/bin cross cross-util
+          RUSTFLAGS="--cap-lints warn" cargo install cross --git https://github.com/cross-rs/cross
         else
           echo "cross-rs already installed (cached)"
         fi
