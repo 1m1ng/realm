@@ -18,6 +18,11 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
+      - name: install toolchain
+        uses: ./.github/actions/toolchain
+        with:
+          target: x86_64-unknown-linux-gnu
+          write-build-cache: false
       - name: kaminari resolves to the pinned fork revision
         run: |
           set -euo pipefail
@@ -48,7 +53,25 @@ jobs:
               ;;
           esac
 
-          echo "kaminari pinned to $want"
+          # Grepping the committed lockfile only proves the committed lockfile.
+          # Nothing else in this workflow builds with --locked, so a lockfile
+          # that has drifted from Cargo.toml is silently re-resolved at build
+          # time and the text check above passes against a file the build did
+          # not use. Ask cargo what it actually resolves, with --locked so a
+          # drifted lockfile is an error rather than a quiet rewrite.
+          source=$(cargo metadata --locked --format-version 1 \
+                   | python3 -c 'import json,sys; print(next((p["source"] or "") for p in json.load(sys.stdin)["packages"] if p["name"]=="kaminari"), end="")')
+          case "$source" in
+            *"git+"*"?rev=$want"*) ;;
+            *)
+              echo "::error::cargo resolves kaminari to:"
+              echo "  ${source:-<none>}"
+              echo "expected a git+ source at rev $want."
+              exit 1
+              ;;
+          esac
+
+          echo "kaminari pinned to $want, and cargo resolves it there"
 
   clippy:
     runs-on: >-

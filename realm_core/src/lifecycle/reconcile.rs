@@ -290,8 +290,15 @@ impl<S: EndpointSource> Reconciler<S> {
         // replay decision below and the diff must judge the desired state
         // against what is on disk now, not against what it said when it was
         // written. Off the reconciler task, since a refresh may read files.
+        let mut unrefreshed: BTreeMap<EndpointId, String> = BTreeMap::new();
         for endpoint in endpoints.iter_mut() {
-            endpoint.spec = refresh_offloaded(&endpoint.spec).await;
+            match refresh_offloaded(&endpoint.spec).await {
+                Ok(refreshed) => endpoint.spec = refreshed,
+                Err(error) => {
+                    log::error!("[reconcile]cannot refresh {}: {}", endpoint.id, error);
+                    unrefreshed.insert(endpoint.id.clone(), error);
+                }
+            }
         }
 
         // a repeated submission of the active generation replays the first
@@ -300,7 +307,7 @@ impl<S: EndpointSource> Reconciler<S> {
         // generation for different desired states must not both be told the
         // first one succeeded, so a same-generation content mismatch is a
         // terminal conflict rather than a false replay.
-        if self.active == Some(generation) {
+        if self.active == Some(generation) && unrefreshed.is_empty() {
             match &self.last {
                 Some(last) if self.last_digest == Some(digest) => {
                     // the description is the one that was applied, but the
@@ -337,7 +344,7 @@ impl<S: EndpointSource> Reconciler<S> {
             );
         }
 
-        let response = self.apply_generation(generation, endpoints).await;
+        let response = self.apply_generation(generation, endpoints, unrefreshed).await;
 
         self.active = Some(generation);
         self.partial = response.state == GenerationState::PartiallyApplied;
@@ -401,7 +408,14 @@ impl<S: EndpointSource> Reconciler<S> {
             // down. Refresh before building *and* before the description enters
             // the applied set, so the restart comes back on what is on disk now
             // and the agent's first submission does not diff as changed.
-            let spec = refresh_offloaded(&spec).await;
+            let spec = match refresh_offloaded(&spec).await {
+                Ok(refreshed) => refreshed,
+                Err(e) => {
+                    log::error!("[reconcile]cannot restore {}: {}", id, e);
+                    outcome.failed.push((id, e));
+                    continue;
+                }
+            };
 
             // build off the reconciler task: it may resolve dns, which blocks
             let built = match build_offloaded(&spec).await {
@@ -457,6 +471,7 @@ impl<S: EndpointSource> Reconciler<S> {
         &mut self,
         generation: Generation,
         endpoints: Vec<DesiredEndpoint<S>>,
+        mut unrefreshed: BTreeMap<EndpointId, String>,
     ) -> ReconcileResponse {
         // ---- validation, without side effects (R3, R4) -------------------
         let mut desired: BTreeMap<EndpointId, S> = BTreeMap::new();
@@ -470,6 +485,15 @@ impl<S: EndpointSource> Reconciler<S> {
                         error: format!("duplicate endpoint id `{}` in one generation", id),
                     },
                 );
+                continue;
+            }
+
+            // an endpoint whose derived state could not be recomputed is not
+            // safe to diff: its comparison would turn on a default value rather
+            // than on what is actually on disk. Fail it here, where the invalid
+            // arm below keeps a serving listener up and reports the reason.
+            if let Some(error) = unrefreshed.remove(&id) {
+                plans.insert(id, Plan::Invalid { error });
                 continue;
             }
 
@@ -893,10 +917,19 @@ async fn build_offloaded<S: EndpointSource>(spec: &S) -> Result<EndpointSpec, St
 /// `EndpointSource::refresh` may read files — a certificate on a hung mount,
 /// say — and the reconciler is the single serial consumer that also answers
 /// status and readiness, so this goes to the blocking pool just as `build`
-/// does. A join failure — a panic inside `refresh`, or a cancelled
-/// blocking pool — leaves the description exactly as it was submitted, which is
-/// what a hook that did nothing would give (#11).
-async fn refresh_offloaded<S: EndpointSource>(spec: &S) -> S {
+/// does. A join failure — a panic inside `refresh`, or a cancelled blocking
+/// pool — is a failed endpoint, not a dead reconciler, the same way a build
+/// join failure is (#11).
+///
+/// Falling back to the description *as submitted* would be worse than failing
+/// it. A hook that never ran leaves the derived state at its default on one
+/// side of the comparison while the applied side still carries the real value,
+/// so the two differ for a reason that has nothing to do with the material:
+/// the endpoint is torn down and rebuilt for nothing, or — on the replay path —
+/// a retry is refused as a conflict that no later generation explains. Failing
+/// the endpoint keeps a serving listener up, says so, and heals on the next
+/// generation.
+async fn refresh_offloaded<S: EndpointSource>(spec: &S) -> Result<S, String> {
     let mut owned = spec.clone();
     match tokio::task::spawn_blocking(move || {
         owned.refresh();
@@ -904,14 +937,9 @@ async fn refresh_offloaded<S: EndpointSource>(spec: &S) -> S {
     })
     .await
     {
-        Ok(refreshed) => refreshed,
-        Err(join) => {
-            log::warn!(
-                "[reconcile]refreshing an endpoint failed, using it as submitted: {}",
-                join
-            );
-            spec.clone()
-        }
+        Ok(refreshed) => Ok(refreshed),
+        Err(join) if join.is_panic() => Err(format!("refreshing the endpoint panicked: {}", join)),
+        Err(join) => Err(format!("refreshing the endpoint failed: {}", join)),
     }
 }
 

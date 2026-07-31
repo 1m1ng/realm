@@ -217,9 +217,24 @@ async fn the_client_ca_capability_token_is_exactly_as_the_consumer_expects() {
         .map(|c| c.as_str().unwrap())
         .collect();
 
+    #[cfg(feature = "transport")]
     assert!(
         advertised.contains(&"client-ca-verify"),
         "the capability token must be spelled exactly `client-ca-verify`, got {:?}",
+        advertised
+    );
+
+    // The other direction matters just as much. A build without `transport`
+    // parses `remote_transport` off the wire and drops it -- `build_transport`
+    // is feature-gated -- so `ca=` is ignored and the peer is reached
+    // unverified. Advertising the token there would answer the probe the docs
+    // tell the control plane to trust instead of comparing versions, and the
+    // caller would believe a node verifies against its private anchor while it
+    // connects in the clear.
+    #[cfg(not(feature = "transport"))]
+    assert!(
+        !advertised.contains(&"client-ca-verify"),
+        "a build without the transport feature must not claim client-ca-verify, got {:?}",
         advertised
     );
 }
@@ -649,8 +664,30 @@ async fn a_stale_socket_is_replaced_and_a_live_one_is_not() {
 mod rotation {
     use super::*;
 
-    use std::process::{Command, Stdio};
     use std::sync::Once;
+
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair, KeyUsagePurpose,
+    };
+    use realm::core::kaminari::AsyncConnect;
+    use realm::core::kaminari::nop::NopConnect;
+    use realm::core::kaminari::tls::{TlsClientConf, TlsConnect};
+
+    /// The name every leaf here is issued for, and the sni every handshake
+    /// here offers.
+    const NAME: &str = "example.com";
+
+    /// A self-signed root, kept whole so a leaf can be issued from it: reading
+    /// one back out of its pem file would need a certificate parser this suite
+    /// has no other use for.
+    type Ca = CertifiedIssuer<'static, KeyPair>;
+
+    fn dn(cn: &str) -> DistinguishedName {
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, cn);
+        dn
+    }
 
     /// The rustls provider is a process-wide singleton and installing it twice
     /// panics; realm's binary does it once at startup, so a test that builds a
@@ -660,136 +697,82 @@ mod rotation {
         ONCE.call_once(realm::core::kaminari::install_tls_provider);
     }
 
-    /// Write a fresh self-signed leaf and its key to `cert`/`key`.
+    /// Write a fresh self-signed certificate for `example.com` and its key to
+    /// `cert`/`key`, handing back the root itself so a test can name the der
+    /// bytes it just wrote — and so a leaf can be issued from it.
     ///
-    /// Real material, generated per run: a certificate checked into the tree
+    /// Real material, generated per run rather than checked in: a fixture
     /// would eventually expire, and the acceptor really does parse what it is
-    /// handed.
-    fn self_signed(cert: &Path, key: &Path, cn: &str) {
-        let out = Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "ec",
-                "-pkeyopt",
-                "ec_paramgen_curve:prime256v1",
-                "-nodes",
-                "-days",
-                "3650",
-                "-subj",
-                &format!("/CN={}", cn),
-                "-addext",
-                "subjectAltName=DNS:example.com",
-                "-keyout",
-                key.to_str().unwrap(),
-                "-out",
-                cert.to_str().unwrap(),
-            ])
-            .output()
-            .expect("openssl generates the test material");
-        assert!(
-            out.status.success(),
-            "openssl failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+    /// handed. It is issued as a ca so the same helper serves both roles, the
+    /// anchor a client pins and the certificate a listener presents.
+    fn self_signed(cert: &Path, key: &Path, cn: &str) -> Ca {
+        let signing_key = KeyPair::generate().expect("a test key");
+
+        let mut params = CertificateParams::new(vec![String::from(NAME)]).expect("root params");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.distinguished_name = dn(cn);
+
+        let root = CertifiedIssuer::self_signed(params, signing_key).expect("a self signed root");
+
+        std::fs::write(cert, root.pem()).expect("the certificate is writable");
+        std::fs::write(key, root.key().serialize_pem()).expect("the key is writable");
+
+        root
     }
 
-    /// A leaf for `example.com` signed by the root in `ca`/`ca_key`.
+    /// A leaf for `example.com` signed by `ca`, written to `cert`/`key`.
     ///
     /// A trust anchor cannot double as the certificate a listener presents:
     /// rustls rejects that outright (`CaUsedAsEndEntity`), so any test that
     /// wants a connection to actually verify needs two certificates.
-    fn leaf_signed_by(dir: &Path, ca: &Path, ca_key: &Path, cert: &Path, key: &Path) {
-        let csr = dir.join("leaf.csr");
-        let ext = dir.join("leaf.ext");
-        std::fs::write(
-            &ext,
-            "subjectAltName=DNS:example.com\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n",
-        )
-        .unwrap();
+    fn leaf_signed_by(ca: &Ca, cert: &Path, key: &Path) {
+        let signing_key = KeyPair::generate().expect("a leaf key");
 
-        let openssl = |args: &[&str]| {
-            let out = Command::new("openssl")
-                .args(args)
-                .output()
-                .expect("openssl generates the test material");
-            assert!(
-                out.status.success(),
-                "openssl {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
+        let mut params = CertificateParams::new(vec![String::from(NAME)]).expect("leaf params");
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.distinguished_name = dn(NAME);
 
-        openssl(&[
-            "req",
-            "-newkey",
-            "ec",
-            "-pkeyopt",
-            "ec_paramgen_curve:prime256v1",
-            "-nodes",
-            "-subj",
-            "/CN=example.com",
-            "-keyout",
-            key.to_str().unwrap(),
-            "-out",
-            csr.to_str().unwrap(),
-        ]);
-        openssl(&[
-            "x509",
-            "-req",
-            "-in",
-            csr.to_str().unwrap(),
-            "-CA",
-            ca.to_str().unwrap(),
-            "-CAkey",
-            ca_key.to_str().unwrap(),
-            "-set_serial",
-            "1",
-            "-days",
-            "3650",
-            "-extfile",
-            ext.to_str().unwrap(),
-            "-out",
-            cert.to_str().unwrap(),
-        ]);
-    }
+        let leaf = params.signed_by(&signing_key, ca).expect("a leaf the root signed");
 
-    /// The base64 body of the first certificate in a pem document.
-    fn first_pem_cert(pem: &str) -> Option<String> {
-        let body = pem.split_once("-----BEGIN CERTIFICATE-----")?.1;
-        let body = body.split_once("-----END CERTIFICATE-----")?.0;
-        Some(body.split_whitespace().collect())
+        std::fs::write(cert, leaf.pem()).expect("the certificate is writable");
+        std::fs::write(key, signing_key.serialize_pem()).expect("the key is writable");
     }
 
     /// The leaf a tls listener actually presents on the wire.
-    async fn presented_leaf(addr: SocketAddr) -> String {
-        // A blocking handshake: the test runtime is single-threaded, so this
-        // has to leave the reactor free to drive realm's acceptor.
-        tokio::task::spawn_blocking(move || {
-            let out = Command::new("openssl")
-                .args([
-                    "s_client",
-                    "-connect",
-                    &addr.to_string(),
-                    "-servername",
-                    "example.com",
-                    "-showcerts",
-                ])
-                .stdin(Stdio::null())
-                .output()
-                .expect("openssl s_client is available");
+    ///
+    /// A real handshake against the running listener, because what the
+    /// acceptor serves is the only thing a peer can observe: verification is
+    /// off precisely so that the certificate — whichever one it turns out to
+    /// be — comes back rather than failing the connection.
+    async fn presented_leaf(addr: SocketAddr) -> Vec<u8> {
+        let connector = TlsConnect::new(
+            NopConnect {},
+            TlsClientConf {
+                sni: String::from(NAME),
+                alpn: Vec::new(),
+                insecure: true,
+                early_data: false,
+                ca: None,
+            },
+        )
+        .expect("a tls connector");
 
-            first_pem_cert(&String::from_utf8_lossy(&out.stdout)).unwrap_or_else(|| {
-                panic!(
-                    "the listener presented no certificate: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                )
-            })
-        })
-        .await
-        .expect("the handshake completes")
+        let stream = TcpStream::connect(addr).await.expect("the listener accepts");
+        let mut buf = [0u8; 0];
+        let tls = timeout(Duration::from_secs(5), connector.connect(stream, &mut buf))
+            .await
+            .expect("the handshake completes")
+            .expect("the handshake succeeds");
+
+        tls.get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .expect("the listener presented no certificate")
+            .to_vec()
     }
 
     fn result_for<'a>(body: &'a Value, id: &str) -> &'a Value {
@@ -884,6 +867,12 @@ mod rotation {
             { "id": "bystander", "listen": free_addr().to_string(), "remote": echo.to_string() },
         ]);
 
+        let endpoints_for_rollback = endpoints.clone();
+        // the exact bytes generation 1 serves, so the rollback below restores
+        // material this endpoint has already been built on rather than issuing
+        // a fresh certificate that merely shares a subject
+        let original_anchor = std::fs::read(&ca).expect("the anchor is readable");
+
         let (code, body) = call(
             &socket,
             "PUT",
@@ -910,6 +899,36 @@ mod rotation {
             result_for(&body, "bystander")["action"],
             "unchanged",
             "a rotation must not churn endpoints that name no material: {}",
+            body
+        );
+
+        // Rolling back to material the endpoint already served once is the case
+        // that catches a digest frozen at slot creation: the desired state is
+        // byte-identical to generation 1's, so an endpoint whose remembered
+        // digest never advanced compares equal and collapses into the manager's
+        // no-op fast path -- the withdrawal is reported as converged and never
+        // performed.
+        std::fs::write(&ca, &original_anchor).expect("the anchor is writable");
+
+        let (code, body) = call(
+            &socket,
+            "PUT",
+            "/v1/desired-state",
+            Some(&desired(3, endpoints_for_rollback)),
+        )
+        .await;
+        assert_eq!(code, 200, "{}", body);
+        assert_eq!(
+            result_for(&body, "trusting")["action"],
+            "updated",
+            "rolling material back to bytes this endpoint already served must \
+             still rebuild it -- a frozen digest would report unchanged: {}",
+            body
+        );
+        assert_eq!(
+            result_for(&body, "bystander")["action"],
+            "unchanged",
+            "the rollback must not churn endpoints that name no material: {}",
             body
         );
     }
@@ -996,7 +1015,7 @@ mod rotation {
         let dir = TempDir::new("leaf-rotation");
         let cert = dir.0.join("cert.pem");
         let key = dir.0.join("key.pem");
-        self_signed(&cert, &key, "before rotation");
+        let first = self_signed(&cert, &key, "before rotation").der().to_vec();
 
         let (socket, _shutdown) = serve(&dir, Reconciler::new()).await;
         let echo = spawn_echo("v1:").await;
@@ -1019,12 +1038,10 @@ mod rotation {
         assert_eq!(code, 200, "{}", body);
         assert_eq!(result_for(&body, "server")["action"], "created");
 
-        let first = first_pem_cert(&std::fs::read_to_string(&cert).unwrap()).expect("the test material is a pem cert");
         assert_eq!(presented_leaf(laddr).await, first, "the listener presents its leaf");
 
         // rotate both halves in place
-        self_signed(&cert, &key, "after rotation");
-        let second = first_pem_cert(&std::fs::read_to_string(&cert).unwrap()).expect("the test material is a pem cert");
+        let second = self_signed(&cert, &key, "after rotation").der().to_vec();
         assert_ne!(first, second, "the rotation produced a different leaf");
 
         let (code, body) = call(&socket, "PUT", "/v1/desired-state", Some(&desired(2, endpoints))).await;
@@ -1052,14 +1069,14 @@ mod rotation {
         let dir = TempDir::new("ca-corrupt");
         let ca = dir.0.join("ca.pem");
         let ca_key = dir.0.join("ca.key");
-        self_signed(&ca, &ca_key, "realm test root");
+        let root = self_signed(&ca, &ca_key, "realm test root");
 
         // the peer presents a leaf the anchor signed, and reads neither of the
         // two root files: corrupting what the client trusts must leave the
         // server's own material alone, or one rotation would fail both
         let leaf = dir.0.join("leaf.pem");
         let leaf_key = dir.0.join("leaf.key");
-        leaf_signed_by(&dir.0, &ca, &ca_key, &leaf, &leaf_key);
+        leaf_signed_by(&root, &leaf, &leaf_key);
 
         let intact = std::fs::read(&ca).unwrap();
 
@@ -1155,7 +1172,7 @@ mod rotation {
         let dir = TempDir::new("leaf-corrupt");
         let cert = dir.0.join("cert.pem");
         let key = dir.0.join("key.pem");
-        self_signed(&cert, &key, "serving");
+        let leaf = self_signed(&cert, &key, "serving").der().to_vec();
 
         // unusable material under a path of its own: the rebuild has to be
         // driven by a change in the description, not only in the bytes
@@ -1185,7 +1202,6 @@ mod rotation {
         assert_eq!(code, 200, "{}", body);
         assert_eq!(result_for(&body, "server")["action"], "created");
 
-        let leaf = first_pem_cert(&std::fs::read_to_string(&cert).unwrap()).expect("the test material is a pem cert");
         assert_eq!(presented_leaf(laddr).await, leaf);
 
         let (code, body) = call(&socket, "PUT", "/v1/desired-state", Some(&desired(2, broken))).await;

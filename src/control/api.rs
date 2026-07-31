@@ -35,17 +35,26 @@ pub const CAPABILITIES: &[&str] = &[
     "per-endpoint-drain-timeout",
     "draining-cohort-status",
     "snapshot-restore",
-    // A caller may point a `remote_transport` at a private trust anchor with
-    // `ca=<path>`, and replacing that file's bytes — or a server `cert`/`key`
-    // pair's — is a change the next generation converges on.
-    //
-    // This literal is a contract with the consuming control plane, which
-    // asserts it by test on its side. A divergence resolves that plane's whole
-    // fleet to not-capable with green tests on both ends, so it is not a string
-    // to tidy up. It exists because an older binary silently *ignores* `ca=`
-    // and falls through to public-root verification: there is no error to
-    // detect the absence by, which is exactly why the capability is advertised
-    // rather than inferred from a version.
+];
+
+/// Capabilities this build only has with the `transport` feature (R22, R32).
+///
+/// A caller may point a `remote_transport` at a private trust anchor with
+/// `ca=<path>`, and replacing that file's bytes — or a server `cert`/`key`
+/// pair's — is a change the next generation converges on.
+///
+/// This literal is a contract with the consuming control plane, which asserts
+/// it by test on its side. A divergence resolves that plane's whole fleet to
+/// not-capable with green tests on both ends, so it is not a string to tidy up.
+/// It exists because a binary *without* the feature silently ignores `ca=`:
+/// `build_transport` is `#[cfg(feature = "transport")]`, so the option is
+/// parsed off the wire and dropped and the peer is reached unverified, with no
+/// error for the caller to detect the absence by. That is exactly why the token
+/// must not be advertised by a build that cannot honor it — a slim node would
+/// answer the probe the docs tell the control plane to trust, and then connect
+/// in the clear.
+const TRANSPORT_CAPABILITIES: &[&str] = &[
+    #[cfg(feature = "transport")]
     "client-ca-verify",
 ];
 
@@ -167,7 +176,7 @@ struct VersionDto {
     implementation: &'static str,
     version: &'static str,
     schema_version: u32,
-    capabilities: &'static [&'static str],
+    capabilities: Vec<&'static str>,
     features: String,
 }
 
@@ -440,7 +449,7 @@ fn version() -> Response<BoxBody> {
             implementation: "realm-hot-reload-fork",
             version: VERSION,
             schema_version: SCHEMA_VERSION,
-            capabilities: CAPABILITIES,
+            capabilities: CAPABILITIES.iter().chain(TRANSPORT_CAPABILITIES).copied().collect(),
             features: FEATURES.to_string(),
         },
     )

@@ -24,7 +24,7 @@ members = [
 # option again, and every client would revert to public-root verification. CI
 # fails the build on that, see the patch-integrity gate in ci.yml.
 [patch.crates-io]
-kaminari = { git = "https://github.com/1m1ng/kaminari.git", rev = "d500264a5652cd5ea764949129118865a493c6aa" }
+kaminari = { git = "https://github.com/1m1ng/kaminari.git", rev = "54eeb975d296f0edab9ad42ea728d7a23324efa5" }
 
 
 [lib]
@@ -76,6 +76,13 @@ mmap-allocator = { version = "0.3", optional = true }
 [dev-dependencies]
 env_logger = "0.11"
 serde_json = "1"
+# Certificate material for the tls tests, issued in process. Shelling out to
+# `openssl` would make the suite depend on a binary the windows runners do not
+# have and that ships as LibreSSL on macos; rcgen is already in the graph via
+# kaminari, so this is a dev-dependency edge rather than new third-party code.
+# `ring` rather than the crypto backend realm happens to be built with: the
+# generator has to work under every feature set the suite is run with.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "net", "time"] }
 
 

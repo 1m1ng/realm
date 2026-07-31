@@ -1029,3 +1029,69 @@ async fn a_panic_handling_one_request_does_not_kill_the_reconciler() {
         "status must still answer after a panic"
     );
 }
+
+/// A description whose `refresh` panics. A hook that cannot run leaves the
+/// derived state at its default on one side of the comparison while the applied
+/// side still carries the real value, so silently continuing would tear the
+/// endpoint down for a reason that has nothing to do with its material.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PanicRefreshSpec {
+    listen: String,
+    remote: SocketAddr,
+}
+
+impl EndpointSource for PanicRefreshSpec {
+    fn build(&self) -> Result<EndpointSpec, String> {
+        let laddr: SocketAddr = self.listen.parse().map_err(|e| format!("bad listen: {}", e))?;
+        Ok(EndpointSpec {
+            endpoint: Endpoint {
+                laddr,
+                raddr: RemoteAddr::SocketAddr(self.remote),
+                bind_opts: Default::default(),
+                conn_opts: Default::default(),
+                extra_raddrs: Vec::new(),
+            },
+            tcp: true,
+            udp: false,
+            drain: None,
+            material: None,
+        })
+    }
+
+    fn refresh(&mut self) {
+        panic!("boom: refreshing a poisoned spec");
+    }
+}
+
+#[tokio::test]
+async fn an_endpoint_whose_refresh_panics_fails_alone() {
+    let echo = spawn_echo("v1:").await;
+    let a = free_addr();
+
+    let mut rec = Reconciler::new();
+    let response = rec
+        .reconcile(ReconcileRequest {
+            generation: 1,
+            endpoints: vec![DesiredEndpoint {
+                id: "a".into(),
+                spec: PanicRefreshSpec {
+                    listen: a.to_string(),
+                    remote: echo,
+                },
+            }],
+        })
+        .await
+        .expect("the reconciler survives a panicking refresh");
+
+    assert_eq!(response.state, GenerationState::PartiallyApplied);
+    assert_eq!(response.results[0].action, SlotAction::Failed);
+    let error = response.results[0].error.as_deref().unwrap_or_default();
+    assert!(
+        error.contains("refresh"),
+        "the failure must name what could not run, got: {}",
+        error
+    );
+
+    // the reconciler is still answering
+    assert_eq!(rec.status().len(), 0);
+}

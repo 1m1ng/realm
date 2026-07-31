@@ -566,6 +566,13 @@ impl EndpointManager {
                     slot.state = SlotState::Running;
                     slot.generation = generation;
                     slot.endpoint = spec.endpoint.clone();
+                    // the digest travels with the endpoint it describes. Left
+                    // behind, it would stay frozen at whatever the slot was
+                    // created with, and rotating material *back* to bytes this
+                    // slot once served would compare equal and collapse into
+                    // the no-op fast path -- a withdrawal the control plane
+                    // reports as converged and the node never performs.
+                    slot.material = spec.material;
                     slot.draining.push(spawn_drain(cohort, old_generation, drain.on_update));
                     log::info!(
                         "[lifecycle]{}/{} replaced on {} at generation {}",
@@ -610,6 +617,13 @@ impl EndpointManager {
                     slot.state = SlotState::Running;
                     slot.generation = generation;
                     slot.endpoint = spec.endpoint.clone();
+                    // the digest travels with the endpoint it describes. Left
+                    // behind, it would stay frozen at whatever the slot was
+                    // created with, and rotating material *back* to bytes this
+                    // slot once served would compare equal and collapse into
+                    // the no-op fast path -- a withdrawal the control plane
+                    // reports as converged and the node never performs.
+                    slot.material = spec.material;
                     slot.draining.push(spawn_drain(cohort, old_generation, drain.on_update));
                     log::info!(
                         "[lifecycle]{}/{} moved to {} at generation {}",
@@ -667,6 +681,7 @@ impl EndpointManager {
                     existing.state = slot.state;
                     existing.generation = slot.generation;
                     existing.endpoint = slot.endpoint;
+                    existing.material = slot.material;
                     existing.active = slot.active;
                     existing.draining.extend(slot.draining);
                 }

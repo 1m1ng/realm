@@ -72,9 +72,28 @@ pub fn free_addr_on(host: &str) -> SocketAddr {
     std::net::TcpListener::bind((host, 0)).unwrap().local_addr().unwrap()
 }
 
-/// An ipv4 address nothing is listening on.
+/// An ipv4 address no other test in this binary has been handed.
+///
+/// Binding port 0 asks the kernel for an ephemeral port and then releases it,
+/// so two tests running in parallel can be handed the same one. That alone was
+/// a flake risk; it became a correctness problem once tests started keying
+/// per-test state on the listen address, where a shared port silently makes two
+/// tests read and write each other's entry. Walking a private range *below* the
+/// ephemeral one gives every caller a port to itself and keeps them clear of
+/// whatever the kernel hands out elsewhere.
 pub fn free_addr() -> SocketAddr {
-    free_addr_on("127.0.0.1")
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+
+    for _ in 0..2000 {
+        let port = 30000 + NEXT.fetch_add(1, Ordering::Relaxed) % 10000;
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        // somebody outside this process may still hold it
+        if std::net::TcpListener::bind(addr).is_ok() {
+            return addr;
+        }
+    }
+    panic!("no free port in the test range");
 }
 
 /// Send and read back one answer, failing the test if the relay stalls.

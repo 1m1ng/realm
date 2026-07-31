@@ -599,8 +599,9 @@ mod trust {
     use super::*;
 
     use std::path::Path;
-    use std::process::Command;
     use std::sync::Once;
+
+    use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose};
 
     /// The rustls provider is a process-wide singleton and installing it twice
     /// panics; realm's binary does it once at startup, so a test that builds a
@@ -611,36 +612,24 @@ mod trust {
     }
 
     /// Real material: the trust anchor is parsed by rustls, so a placeholder
-    /// pem body would fail the load for the wrong reason.
+    /// pem body would fail the load for the wrong reason. Issued in process
+    /// rather than by a command line tool the runner may not have, and freshly
+    /// per run rather than checked in, since a fixture would eventually expire.
     fn self_signed(dir: &MaterialDir, cert: &str, key: &str) -> std::path::PathBuf {
-        let cert = dir.0.join(cert);
-        let key = dir.0.join(key);
-        let out = Command::new("openssl")
-            .args([
-                "req",
-                "-x509",
-                "-newkey",
-                "ec",
-                "-pkeyopt",
-                "ec_paramgen_curve:prime256v1",
-                "-nodes",
-                "-days",
-                "3650",
-                "-subj",
-                "/CN=realm test root",
-                "-keyout",
-                key.to_str().unwrap(),
-                "-out",
-                cert.to_str().unwrap(),
-            ])
-            .output()
-            .expect("openssl generates the test material");
-        assert!(
-            out.status.success(),
-            "openssl failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        cert
+        let signing_key = KeyPair::generate().expect("a test key");
+
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "realm test root");
+
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("root params");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.distinguished_name = dn;
+
+        let root = params.self_signed(&signing_key).expect("a self signed root");
+
+        dir.write(key, &signing_key.serialize_pem());
+        dir.write(cert, &root.pem())
     }
 
     fn client_endpoint(options: &str) -> EndpointConf {
