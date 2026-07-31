@@ -5,7 +5,9 @@
 //! caller's, monotonic and idempotent; a repeated submission must neither
 //! duplicate endpoints nor disturb traffic a second time.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +24,29 @@ use realm_core::lifecycle::{
 mod common;
 use common::{ask, free_addr, spawn_echo};
 
+/// Material realm does not own, standing in for a certificate file on disk:
+/// the tests rewrite it in place without touching any field of the
+/// description, and `TestSpec::refresh` reads it into a field serde cannot see.
+/// What it holds decides where the built endpoint actually forwards, so a
+/// rotation that never reaches the built endpoint is visible in the data path.
+///
+/// Keyed by listen address, which is unique per test, so tests running in
+/// parallel in one binary never share an entry.
+static MATERIAL: Mutex<BTreeMap<String, SocketAddr>> = Mutex::new(BTreeMap::new());
+
+/// How many times `refresh` ran, per listen address.
+static REFRESHES: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+
+/// Rewrite the material behind an endpoint, as a certificate rotation would.
+fn rotate_material(listen: &SocketAddr, remote: SocketAddr) {
+    MATERIAL.lock().unwrap().insert(listen.to_string(), remote);
+}
+
+/// How many times the reconciler refreshed the endpoint listening here.
+fn refreshes(listen: &SocketAddr) -> usize {
+    REFRESHES.lock().unwrap().get(&listen.to_string()).copied().unwrap_or(0)
+}
+
 /// Minimal stand-in for the top-level `EndpointConf`: the reconciler only
 /// needs to compare specs and turn them into lifecycle specs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -33,6 +58,14 @@ struct TestSpec {
     /// per-endpoint force-close deadline for a delete, in milliseconds
     #[serde(default)]
     delete_drain_ms: Option<u64>,
+    /// derived from material realm does not own, recomputed by `refresh`.
+    /// `#[serde(skip)]` is what makes it enter the diff — which compares specs
+    /// by `PartialEq` — while staying out of the submission hash and the
+    /// snapshot, which both go through serde. It reaches the built
+    /// endpoint, since a rebuild the manager cannot tell apart from what it is
+    /// already serving is not a rebuild.
+    #[serde(skip)]
+    material: Option<SocketAddr>,
 }
 
 impl TestSpec {
@@ -43,6 +76,7 @@ impl TestSpec {
             tcp: true,
             udp: false,
             delete_drain_ms: None,
+            material: None,
         }
     }
 
@@ -67,7 +101,10 @@ impl EndpointSource for TestSpec {
         Ok(EndpointSpec {
             endpoint: Endpoint {
                 laddr,
-                raddr: RemoteAddr::SocketAddr(self.remote),
+                // what the material says wins over what the description says,
+                // the way a certificate's bytes decide what a `cert = <path>`
+                // endpoint actually presents
+                raddr: RemoteAddr::SocketAddr(self.material.unwrap_or(self.remote)),
                 bind_opts: Default::default(),
                 conn_opts: Default::default(),
                 extra_raddrs: Vec::new(),
@@ -76,6 +113,11 @@ impl EndpointSource for TestSpec {
             udp: self.udp,
             drain,
         })
+    }
+
+    fn refresh(&mut self) {
+        *REFRESHES.lock().unwrap().entry(self.listen.clone()).or_default() += 1;
+        self.material = MATERIAL.lock().unwrap().get(&self.listen).copied();
     }
 }
 
@@ -209,6 +251,7 @@ async fn an_invalid_endpoint_does_not_block_the_others() {
         tcp: true,
         udp: false,
         delete_drain_ms: None,
+        material: None,
     };
 
     let mut rec = Reconciler::new();
@@ -312,6 +355,7 @@ async fn one_protocol_failing_yields_a_partially_applied_generation() {
         tcp: true,
         udp: true,
         delete_drain_ms: None,
+        material: None,
     };
 
     let mut rec = Reconciler::new();
@@ -516,6 +560,7 @@ async fn a_partial_protocol_failure_leaves_the_healthy_sibling_untouched() {
         tcp: true,
         udp: true,
         delete_drain_ms: None,
+        material: None,
     };
 
     let mut rec = Reconciler::new();
@@ -744,6 +789,141 @@ async fn a_same_generation_with_different_content_is_refused() {
     assert_eq!(replay.generation, 5);
     assert_eq!(replay.results.len(), 1);
     assert_eq!(replay.results[0].action, SlotAction::Created);
+}
+
+/// Every submitted endpoint has its caller-owned derived state refreshed
+/// exactly once per generation — not zero times, which would let rotated
+/// material go unnoticed, and not twice, which would double every read.
+#[tokio::test]
+async fn every_submitted_endpoint_is_refreshed_once_per_generation() {
+    let echo = spawn_echo("v1:").await;
+    let (a, b) = (free_addr(), free_addr());
+
+    let mut rec = Reconciler::new();
+    rec.reconcile(request(
+        1,
+        &[("a", TestSpec::tcp(a, echo)), ("b", TestSpec::tcp(b, echo))],
+    ))
+    .await
+    .unwrap();
+    assert_eq!(refreshes(&a), 1, "a is refreshed once for generation 1");
+    assert_eq!(refreshes(&b), 1, "b is refreshed once for generation 1");
+
+    rec.reconcile(request(
+        2,
+        &[("a", TestSpec::tcp(a, echo)), ("b", TestSpec::tcp(b, echo))],
+    ))
+    .await
+    .unwrap();
+    assert_eq!(refreshes(&a), 2, "a is refreshed once more for generation 2");
+    assert_eq!(refreshes(&b), 2, "b is refreshed once more for generation 2");
+}
+
+/// Material realm does not own changes without any field of the
+/// description changing — a certificate replaced in place. The refreshed
+/// derived state must make that a replace, or the endpoint keeps serving
+/// pre-rotation material while the control plane reports convergence.
+#[tokio::test]
+async fn rotated_material_makes_an_otherwise_identical_spec_a_replace() {
+    let echo1 = spawn_echo("v1:").await;
+    let echo2 = spawn_echo("v2:").await;
+    let a = free_addr();
+    let spec = TestSpec::tcp(a, echo1);
+
+    let mut rec = Reconciler::new();
+    rec.reconcile(request(1, &[("a", spec.clone())])).await.unwrap();
+
+    // the material behind the endpoint is replaced in place: the description
+    // the agent submits is byte-for-byte the one it submitted before
+    rotate_material(&a, echo2);
+
+    let response = rec.reconcile(request(2, &[("a", spec)])).await.unwrap();
+    assert_eq!(
+        response.results[0].action,
+        SlotAction::Updated,
+        "rotated material must rebuild the endpoint: {:?}",
+        response.results
+    );
+
+    // and the endpoint really serves the rotated material
+    let mut on_a = TcpStream::connect(a).await.unwrap();
+    assert_eq!(ask(&mut on_a, b"x").await, "v2:x");
+}
+
+/// The derived field must stay out of the submission hash, so the replay
+/// contract (R8) is unchanged for genuine retries. A genuine
+/// retry — same generation, same description, unchanged material — still
+/// replays the first answer, even when the derived state is not its default.
+#[tokio::test]
+async fn a_retry_with_unchanged_material_still_replays() {
+    let echo1 = spawn_echo("v1:").await;
+    let echo2 = spawn_echo("v2:").await;
+    let a = free_addr();
+    // the material is already something other than its default, so the derived
+    // field is non-default in both submissions
+    rotate_material(&a, echo2);
+    let spec = TestSpec::tcp(a, echo1);
+
+    let mut rec = Reconciler::new();
+    let first = rec.reconcile(request(5, &[("a", spec.clone())])).await.unwrap();
+    assert_eq!(first.results[0].action, SlotAction::Created);
+
+    // the endpoint serves what the material says, not what the description says
+    let mut established = TcpStream::connect(a).await.unwrap();
+    assert_eq!(ask(&mut established, b"x").await, "v2:x");
+
+    let replay = rec
+        .reconcile(request(5, &[("a", spec)]))
+        .await
+        .expect("an unchanged retry of the active generation replays");
+    assert_eq!(replay.generation, 5);
+    assert_eq!(replay.results.len(), first.results.len());
+    assert_eq!(replay.results[0].action, first.results[0].action);
+
+    // nothing was disturbed a second time
+    assert_eq!(ask(&mut established, b"y").await, "v2:y");
+    assert_eq!(rec.status().len(), 1, "no duplicate endpoint was created");
+}
+
+/// Once the material has rotated, the active generation's answer no
+/// longer describes what the endpoint is serving. Replaying it would be a
+/// false success that persists until something unrelated forces the next
+/// generation, so the resubmission is refused as a conflict instead.
+#[tokio::test]
+async fn a_generation_resubmitted_after_its_material_rotated_is_refused() {
+    let echo1 = spawn_echo("v1:").await;
+    let echo2 = spawn_echo("v2:").await;
+    let a = free_addr();
+    let spec = TestSpec::tcp(a, echo1);
+
+    let mut rec = Reconciler::new();
+    rec.reconcile(request(5, &[("a", spec.clone())])).await.unwrap();
+
+    rotate_material(&a, echo2);
+
+    let err = rec
+        .reconcile(request(5, &[("a", spec)]))
+        .await
+        .expect_err("the active generation's answer no longer holds");
+    match err {
+        ReconcileError::Stale { active } => assert_eq!(active, 5),
+        other => panic!("expected a terminal refusal, got {:?}", other),
+    }
+    assert!(!err.is_retryable(), "resubmitting the same generation cannot help");
+
+    // the endpoint was not disturbed: the refusal tells the caller to advance
+    // the generation, it does not tear anything down
+    let mut on_a = TcpStream::connect(a).await.unwrap();
+    assert_eq!(ask(&mut on_a, b"x").await, "v1:x");
+
+    // and the next generation applies the rotated material
+    let response = rec
+        .reconcile(request(6, &[("a", TestSpec::tcp(a, echo1))]))
+        .await
+        .unwrap();
+    assert_eq!(response.results[0].action, SlotAction::Updated);
+    let mut on_a = TcpStream::connect(a).await.unwrap();
+    assert_eq!(ask(&mut on_a, b"x").await, "v2:x");
 }
 
 /// A desired-state shape whose spec comparison panics, used only to prove the

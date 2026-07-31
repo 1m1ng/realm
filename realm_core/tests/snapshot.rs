@@ -5,24 +5,42 @@
 //! agent's next reconcile. The snapshot is written atomically, and restoring it
 //! reuses the partially-applied semantics when some endpoint cannot come back.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
 
 use realm_core::endpoint::{Endpoint, RemoteAddr};
 use realm_core::lifecycle::{
-    DesiredEndpoint, EndpointSource, EndpointSpec, ReconcileError, ReconcileRequest, Reconciler, Snapshot,
+    DesiredEndpoint, EndpointSource, EndpointSpec, ReconcileError, ReconcileRequest, Reconciler, SlotAction, Snapshot,
     SnapshotStore,
 };
 
 mod common;
 use common::{TempDir, ask, free_addr, spawn_echo};
 
+/// Material realm does not own, standing in for a certificate file on disk,
+/// keyed by listen address so parallel tests never share an entry. It is what
+/// `refresh` reads, it decides where the built endpoint really forwards, and it
+/// can be rewritten while realm is down.
+static MATERIAL: Mutex<BTreeMap<String, SocketAddr>> = Mutex::new(BTreeMap::new());
+
+/// Rewrite the material behind an endpoint, as a certificate rotation would.
+fn rotate_material(listen: &SocketAddr, remote: SocketAddr) {
+    MATERIAL.lock().unwrap().insert(listen.to_string(), remote);
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct TestSpec {
     listen: String,
     remote: SocketAddr,
+    /// derived from material realm does not own; `#[serde(skip)]` keeps it out
+    /// of the snapshot, so a restored description carries the default until it
+    /// is refreshed.
+    #[serde(skip)]
+    material: Option<SocketAddr>,
 }
 
 impl EndpointSource for TestSpec {
@@ -35,7 +53,8 @@ impl EndpointSource for TestSpec {
         Ok(EndpointSpec {
             endpoint: Endpoint {
                 laddr,
-                raddr: RemoteAddr::SocketAddr(self.remote),
+                // what the material says wins over what the description says
+                raddr: RemoteAddr::SocketAddr(self.material.unwrap_or(self.remote)),
                 bind_opts: Default::default(),
                 conn_opts: Default::default(),
                 extra_raddrs: Vec::new(),
@@ -44,6 +63,10 @@ impl EndpointSource for TestSpec {
             udp: false,
             drain: None,
         })
+    }
+
+    fn refresh(&mut self) {
+        self.material = MATERIAL.lock().unwrap().get(&self.listen).copied();
     }
 }
 
@@ -70,6 +93,7 @@ async fn a_restarted_process_restores_its_snapshot() {
     let spec = TestSpec {
         listen: a.to_string(),
         remote: echo,
+        material: None,
     };
 
     // first process: apply and shut down
@@ -99,6 +123,60 @@ async fn a_restarted_process_restores_its_snapshot() {
     assert_eq!(ask(&mut stream, b"x").await, "v1:x");
 }
 
+/// A restored description is refreshed before it enters the applied set,
+/// so it reflects the material on disk *now* rather than the material that was
+/// there when the snapshot was written. Without this, the first submission
+/// after every restart diffs as changed and rebuilds every endpoint whose
+/// description carries derived state.
+#[tokio::test]
+async fn a_restored_endpoint_is_refreshed_before_it_is_applied() {
+    let dir = TempDir::new("restore-refresh");
+    let echo1 = spawn_echo("v1:").await;
+    let echo2 = spawn_echo("v2:").await;
+    let a = free_addr();
+    let spec = TestSpec {
+        listen: a.to_string(),
+        remote: echo1,
+        material: None,
+    };
+
+    // first process: apply and shut down
+    {
+        let mut rec = Reconciler::with_snapshot(SnapshotStore::new(dir.join("state.json")));
+        rec.restore().await.expect("empty snapshot restores");
+        rec.reconcile(request(11, &[("a", spec.clone())])).await.unwrap();
+        rec.shutdown().await;
+    }
+
+    // the material is rewritten while realm is down. The snapshot cannot know:
+    // the derived field never goes through serde, so what comes back off disk
+    // describes the material of the moment the snapshot was written.
+    rotate_material(&a, echo2);
+
+    let mut rec = Reconciler::<TestSpec>::with_snapshot(SnapshotStore::new(dir.join("state.json")));
+    let outcome = rec.restore().await.expect("snapshot restores");
+    assert_eq!(outcome.restored, 1);
+
+    // the restart comes back on the material that is there now
+    let mut established = TcpStream::connect(a).await.unwrap();
+    assert_eq!(
+        ask(&mut established, b"x").await,
+        "v2:x",
+        "a restored endpoint must serve the material on disk now"
+    );
+
+    // and the agent's next submission matches it, so nothing is rebuilt: the
+    // restored description entered the applied set already refreshed
+    let response = rec.reconcile(request(12, &[("a", spec)])).await.unwrap();
+    assert_eq!(
+        response.results[0].action,
+        SlotAction::Unchanged,
+        "a submission matching on-disk material must not rebuild after a restore: {:?}",
+        response.results
+    );
+    assert_eq!(ask(&mut established, b"y").await, "v2:y");
+}
+
 /// Covers AE13: submissions before the restore finished are refused with a
 /// retryable not-ready error, and succeed afterwards.
 #[tokio::test]
@@ -109,6 +187,7 @@ async fn submissions_before_the_restore_are_not_ready() {
     let spec = TestSpec {
         listen: a.to_string(),
         remote: echo,
+        material: None,
     };
 
     let mut rec = Reconciler::with_snapshot(SnapshotStore::new(dir.join("state.json")));
@@ -147,6 +226,7 @@ async fn a_partial_restore_marks_the_failed_endpoint_only() {
                     TestSpec {
                         listen: good.to_string(),
                         remote: echo,
+                        material: None,
                     },
                 ),
                 (
@@ -154,6 +234,7 @@ async fn a_partial_restore_marks_the_failed_endpoint_only() {
                     TestSpec {
                         listen: blocked.to_string(),
                         remote: echo,
+                        material: None,
                     },
                 ),
             ],
@@ -196,6 +277,7 @@ fn a_leftover_temporary_file_does_not_shadow_the_snapshot() {
             TestSpec {
                 listen: "127.0.0.1:1".into(),
                 remote: "127.0.0.1:2".parse().unwrap(),
+                material: None,
             },
         )]
         .into_iter()
@@ -266,6 +348,7 @@ fn the_snapshot_temp_file_does_not_follow_a_symlink() {
             TestSpec {
                 listen: "127.0.0.1:1".into(),
                 remote: "127.0.0.1:2".parse().unwrap(),
+                material: None,
             },
         )]
         .into_iter()
@@ -302,6 +385,7 @@ fn a_plain_store_round_trips() {
             TestSpec {
                 listen: "127.0.0.1:1".into(),
                 remote: "127.0.0.1:2".parse().unwrap(),
+                material: None,
             },
         )]
         .into_iter()
@@ -367,6 +451,7 @@ async fn the_snapshot_tracks_the_applied_state() {
             TestSpec {
                 listen: a.to_string(),
                 remote: echo,
+                material: None,
             },
         )],
     ))

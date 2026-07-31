@@ -124,6 +124,22 @@ pub trait EndpointSource: Clone + PartialEq + Send + Sync + Serialize + Deserial
     /// Must have no side effect: it runs during the validation phase, before
     /// anything is bound (R3, R4).
     fn build(&self) -> Result<EndpointSpec, String>;
+
+    /// Recompute the state this description derives from material realm does
+    /// not own, so the diff sees what is on disk *now*.
+    ///
+    /// The reconciler decides what to touch by comparing descriptions, and a
+    /// description that names a file says nothing about the file's contents:
+    /// replacing a certificate in place leaves every field identical, so the
+    /// diff sees nothing to do and the endpoint keeps serving pre-rotation
+    /// material. A description that carries a digest of such material — in a
+    /// field serde does not see, so it enters the diff without disturbing the
+    /// submission hash — recomputes it here.
+    ///
+    /// Called on every incoming description before it is diffed, and on every
+    /// description restored from a snapshot. Runs off the reconciler task, so
+    /// blocking reads are allowed. The default does nothing.
+    fn refresh(&mut self) {}
 }
 
 /// Stable id derived from a listen address and the protocols of a rule (R26).
@@ -256,6 +272,7 @@ impl<S: EndpointSource> Reconciler<S> {
 
         let generation = request.generation;
         let digest = digest_of(&request.endpoints);
+        let mut endpoints = request.endpoints;
 
         if let Some(active) = self.active {
             if generation < active {
@@ -266,39 +283,61 @@ impl<S: EndpointSource> Reconciler<S> {
                 );
                 return Err(ReconcileError::Stale { active });
             }
+        }
 
-            // a repeated submission of the active generation replays the first
-            // answer: no duplicate endpoint, no second disturbance (R8, AE4) —
-            // but only when the *content* matches. Two controllers reusing one
-            // generation for different desired states must not both be told the
-            // first one succeeded, so a same-generation content mismatch is a
-            // terminal conflict rather than a false replay.
-            if generation == active {
-                match &self.last {
-                    Some(last) if self.last_digest == Some(digest) => {
-                        log::debug!("[reconcile]replaying generation {}", generation);
-                        return Ok(last.clone());
-                    }
-                    Some(_) => {
+        // Recompute what the descriptions derive from material realm does not
+        // own, once per submission and before anything looks at them: both the
+        // replay decision below and the diff must judge the desired state
+        // against what is on disk now, not against what it said when it was
+        // written. Off the reconciler task, since a refresh may read files.
+        for endpoint in endpoints.iter_mut() {
+            endpoint.spec = refresh_offloaded(&endpoint.spec).await;
+        }
+
+        // a repeated submission of the active generation replays the first
+        // answer: no duplicate endpoint, no second disturbance (R8, AE4) —
+        // but only when the *content* matches. Two controllers reusing one
+        // generation for different desired states must not both be told the
+        // first one succeeded, so a same-generation content mismatch is a
+        // terminal conflict rather than a false replay.
+        if self.active == Some(generation) {
+            match &self.last {
+                Some(last) if self.last_digest == Some(digest) => {
+                    // the description is the one that was applied, but the
+                    // material behind it is not. Replaying "converged" for
+                    // material the endpoint is no longer running would be a
+                    // false success lasting until some unrelated change forces
+                    // the next generation, so this is a conflict too.
+                    if let Some(id) = self.material_drifted(&endpoints) {
                         log::warn!(
-                            "[reconcile]generation {} resubmitted with different content, refusing",
-                            generation
+                            "[reconcile]generation {} resubmitted after {}'s material changed, refusing",
+                            generation,
+                            id
                         );
-                        return Err(ReconcileError::Stale { active });
+                        return Err(ReconcileError::Stale { active: generation });
                     }
-                    None => {}
+                    log::debug!("[reconcile]replaying generation {}", generation);
+                    return Ok(last.clone());
                 }
+                Some(_) => {
+                    log::warn!(
+                        "[reconcile]generation {} resubmitted with different content, refusing",
+                        generation
+                    );
+                    return Err(ReconcileError::Stale { active: generation });
+                }
+                None => {}
             }
         }
 
-        if request.endpoints.is_empty() {
+        if endpoints.is_empty() {
             log::warn!(
                 "[reconcile]generation {} declares an empty desired state: removing every endpoint",
                 generation
             );
         }
 
-        let response = self.apply_generation(generation, request.endpoints).await;
+        let response = self.apply_generation(generation, endpoints).await;
 
         self.active = Some(generation);
         self.partial = response.state == GenerationState::PartiallyApplied;
@@ -357,6 +396,13 @@ impl<S: EndpointSource> Reconciler<S> {
         };
 
         for (id, spec) in snapshot.endpoints {
+            // the snapshot describes the material of the moment it was written,
+            // and that material may have been replaced while the process was
+            // down. Refresh before building *and* before the description enters
+            // the applied set, so the restart comes back on what is on disk now
+            // and the agent's first submission does not diff as changed.
+            let spec = refresh_offloaded(&spec).await;
+
             // build off the reconciler task: it may resolve dns, which blocks
             let built = match build_offloaded(&spec).await {
                 Ok(x) => x,
@@ -569,6 +615,26 @@ impl<S: EndpointSource> Reconciler<S> {
             state,
             results,
         }
+    }
+
+    /// The first endpoint of a same-generation resubmission whose refreshed
+    /// derived state no longer matches what is applied, if any.
+    ///
+    /// Only a difference serde cannot see counts. The digest has already
+    /// established that the submitted descriptions are byte-identical to the
+    /// active generation's, so a difference serde *can* see comes from a
+    /// partial application having kept a previous spec (#5, #9) — that is a
+    /// genuine retry and must still replay, not a rotation of the material
+    /// behind an unchanged description.
+    fn material_drifted<'a>(&self, endpoints: &'a [DesiredEndpoint<S>]) -> Option<&'a EndpointId> {
+        endpoints
+            .iter()
+            .find(|DesiredEndpoint { id, spec }| {
+                self.applied
+                    .get(id)
+                    .is_some_and(|applied| applied != spec && serializes_alike(applied, spec))
+            })
+            .map(|endpoint| &endpoint.id)
     }
 
     /// Whether every protocol the desired spec asks for is actually running.
@@ -819,6 +885,42 @@ async fn build_offloaded<S: EndpointSource>(spec: &S) -> Result<EndpointSpec, St
     match tokio::task::spawn_blocking(move || spec.build()).await {
         Ok(result) => result,
         Err(join) => Err(format!("building the endpoint failed: {}", join)),
+    }
+}
+
+/// Refresh a description's derived state without blocking the reconciler task.
+///
+/// `EndpointSource::refresh` may read files — a certificate on a hung mount,
+/// say — and the reconciler is the single serial consumer that also answers
+/// status and readiness, so this goes to the blocking pool just as `build`
+/// does. A join failure — a panic inside `refresh`, or a cancelled
+/// blocking pool — leaves the description exactly as it was submitted, which is
+/// what a hook that did nothing would give (#11).
+async fn refresh_offloaded<S: EndpointSource>(spec: &S) -> S {
+    let mut owned = spec.clone();
+    match tokio::task::spawn_blocking(move || {
+        owned.refresh();
+        owned
+    })
+    .await
+    {
+        Ok(refreshed) => refreshed,
+        Err(join) => {
+            log::warn!(
+                "[reconcile]refreshing an endpoint failed, using it as submitted: {}",
+                join
+            );
+            spec.clone()
+        }
+    }
+}
+
+/// Whether two descriptions serialize identically — that is, whether they
+/// differ only in fields serde does not see.
+fn serializes_alike<S: EndpointSource>(a: &S, b: &S) -> bool {
+    match (serde_json::to_vec(a), serde_json::to_vec(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
