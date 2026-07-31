@@ -252,6 +252,21 @@ remote_transport = "tls"
     assert!(err.to_string().contains("remote_transport"), "{}", err);
 }
 
+#[test]
+fn an_endpoint_naming_no_transport_still_builds() {
+    // the transport path is optional: an endpoint that names neither a listen
+    // nor a remote transport must build without going near tls at all.
+    let ep = single_endpoint(
+        r#"
+[[endpoints]]
+listen = "127.0.0.1:10000"
+remote = "127.0.0.1:20000"
+"#,
+    );
+
+    ep.build().expect("an endpoint with no transport must still build");
+}
+
 #[cfg(feature = "transport")]
 #[test]
 fn valid_transport_still_builds() {
@@ -334,10 +349,10 @@ mod material {
     use std::path::{Path, PathBuf};
 
     /// A private directory for one test's certificate material, removed on drop.
-    struct MaterialDir(PathBuf);
+    pub(super) struct MaterialDir(pub(super) PathBuf);
 
     impl MaterialDir {
-        fn new(name: &str) -> Self {
+        pub(super) fn new(name: &str) -> Self {
             let mut path = std::env::temp_dir();
             path.push(format!("realm-material-{}-{}", name, std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
@@ -345,7 +360,7 @@ mod material {
             Self(path)
         }
 
-        fn write(&self, name: &str, content: &str) -> PathBuf {
+        pub(super) fn write(&self, name: &str, content: &str) -> PathBuf {
             let path = self.0.join(name);
             std::fs::write(&path, content).unwrap();
             path
@@ -360,7 +375,7 @@ mod material {
 
     /// A toml basic string: `Debug` escapes exactly what toml needs, so a
     /// windows path with backslashes survives being embedded in a document.
-    fn quoted(s: &str) -> String {
+    pub(super) fn quoted(s: &str) -> String {
         format!("{:?}", s)
     }
 
@@ -569,5 +584,135 @@ listen_transport = {}
             first, second,
             "a path past the read cap must digest as unreadable, not as its contents"
         );
+    }
+}
+
+// A `ca=` names the roots this endpoint is willing to trust *instead of* the
+// public bundle. Material the endpoint cannot load therefore has exactly one
+// safe answer — fail the endpoint. Building anyway would leave a connection
+// that verifies against the very roots the operator replaced, and it would
+// look like success from every angle the control plane can see.
+
+#[cfg(feature = "transport")]
+mod trust {
+    use super::material::{MaterialDir, quoted};
+    use super::*;
+
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::Once;
+
+    /// The rustls provider is a process-wide singleton and installing it twice
+    /// panics; realm's binary does it once at startup, so a test that builds a
+    /// tls transport has to do the same.
+    fn install_tls_provider() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(realm::core::kaminari::install_tls_provider);
+    }
+
+    /// Real material: the trust anchor is parsed by rustls, so a placeholder
+    /// pem body would fail the load for the wrong reason.
+    fn self_signed(dir: &MaterialDir, cert: &str, key: &str) -> std::path::PathBuf {
+        let cert = dir.0.join(cert);
+        let key = dir.0.join(key);
+        let out = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:prime256v1",
+                "-nodes",
+                "-days",
+                "3650",
+                "-subj",
+                "/CN=realm test root",
+                "-keyout",
+                key.to_str().unwrap(),
+                "-out",
+                cert.to_str().unwrap(),
+            ])
+            .output()
+            .expect("openssl generates the test material");
+        assert!(
+            out.status.success(),
+            "openssl failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        cert
+    }
+
+    fn client_endpoint(options: &str) -> EndpointConf {
+        single_endpoint(&format!(
+            r#"
+[[endpoints]]
+listen = "127.0.0.1:10000"
+remote = "127.0.0.1:20000"
+remote_transport = {}
+"#,
+            quoted(options)
+        ))
+    }
+
+    fn trusting(ca: &Path) -> EndpointConf {
+        client_endpoint(&format!("tls;sni=example.com;ca={}", ca.display()))
+    }
+
+    #[test]
+    fn a_trust_anchor_that_is_not_there_fails_the_endpoint() {
+        install_tls_provider();
+
+        let dir = MaterialDir::new("absent-anchor");
+        let missing = dir.0.join("nowhere.pem");
+
+        let err = trusting(&missing)
+            .build()
+            .expect_err("a trust anchor that cannot be read must fail the endpoint, not fall back to the public roots");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("remote_transport"),
+            "the error must name the field: {}",
+            msg
+        );
+        assert!(
+            msg.contains(&missing.display().to_string()),
+            "the error must name the material it could not load: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn a_trust_anchor_together_with_insecure_fails_the_endpoint() {
+        install_tls_provider();
+
+        // pinning to a private root and disabling verification are opposite
+        // instructions; honouring either one silently is a downgrade.
+        let err = client_endpoint("tls;sni=example.com;ca=/does/not/matter.pem;insecure")
+            .build()
+            .expect_err("`ca` together with `insecure` must be rejected");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("remote_transport"),
+            "the error must name the field: {}",
+            msg
+        );
+        assert!(
+            msg.contains("insecure"),
+            "the error must say which two options conflict: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn a_usable_trust_anchor_builds() {
+        install_tls_provider();
+
+        let dir = MaterialDir::new("usable-anchor");
+        let ca = self_signed(&dir, "ca.pem", "ca.key");
+
+        trusting(&ca).build().expect("a readable trust anchor must build");
     }
 }

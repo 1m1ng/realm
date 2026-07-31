@@ -24,7 +24,7 @@ members = [
 # option again, and every client would revert to public-root verification. CI
 # fails the build on that, see the patch-integrity gate in ci.yml.
 [patch.crates-io]
-kaminari = { git = "https://github.com/1m1ng/kaminari.git", rev = "b8c6e620f4c25f8bebb3aead7a3259535999f3dc" }
+kaminari = { git = "https://github.com/1m1ng/kaminari.git", rev = "d500264a5652cd5ea764949129118865a493c6aa" }
 
 
 [lib]

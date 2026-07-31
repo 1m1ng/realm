@@ -247,14 +247,39 @@ impl EndpointConf {
         ) {
             Ok(None)
         } else {
+            // Construction is where the certificate material named by the
+            // options is actually read: a `ca=` bundle that cannot be loaded,
+            // a leaf rustls will not accept, an sni that is not a dns name.
+            // Every one of those fails the endpoint. There is deliberately no
+            // fallback — a client that quietly went back to the public bundle
+            // would verify against exactly the roots the operator replaced,
+            // and nothing the control plane reports would say so.
+            //
+            // kaminari's error already names the file or the value it choked
+            // on, which is what the operator needs; the field name is what
+            // says which of the two transport strings it came from.
             let ac = MixAccept::new_shared(MixServerConf {
                 ws: listen_ws,
                 tls: listen_tls,
-            });
+            })
+            .map_err(|e| {
+                BuildError::new(
+                    "listen_transport",
+                    listen_transport.as_deref().unwrap_or_default(),
+                    e.to_string(),
+                )
+            })?;
             let cc = MixConnect::new_shared(MixClientConf {
                 ws: remote_ws,
                 tls: remote_tls,
-            });
+            })
+            .map_err(|e| {
+                BuildError::new(
+                    "remote_transport",
+                    remote_transport.as_deref().unwrap_or_default(),
+                    e.to_string(),
+                )
+            })?;
             Ok(Some((ac, cc)))
         }
     }

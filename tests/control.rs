@@ -120,11 +120,27 @@ async fn spawn_echo(tag: &'static str) -> SocketAddr {
     addr
 }
 
+/// An address no other test in this binary has been handed.
+///
+/// Binding port 0 asks the kernel for an ephemeral port and then releases it,
+/// so two tests running in parallel can be handed the same one — whichever
+/// endpoint binds it second fails with `AddrInUse`, and the test reading that
+/// result sees `failed` where it expected an outcome of its own. Walking a
+/// private range *below* the ephemeral one gives every caller a port to
+/// itself, and keeps them clear of whatever the kernel hands out elsewhere.
 fn free_addr() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+
+    for _ in 0..2000 {
+        let port = 20000 + NEXT.fetch_add(1, Ordering::Relaxed) % 10000;
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        // somebody outside this process may still hold it
+        if std::net::TcpListener::bind(addr).is_ok() {
+            return addr;
+        }
+    }
+    panic!("no free port in the test range");
 }
 
 /// Start a control plane over a fresh reconciler, and return its socket path.
@@ -642,6 +658,67 @@ mod rotation {
         );
     }
 
+    /// A leaf for `example.com` signed by the root in `ca`/`ca_key`.
+    ///
+    /// A trust anchor cannot double as the certificate a listener presents:
+    /// rustls rejects that outright (`CaUsedAsEndEntity`), so any test that
+    /// wants a connection to actually verify needs two certificates.
+    fn leaf_signed_by(dir: &Path, ca: &Path, ca_key: &Path, cert: &Path, key: &Path) {
+        let csr = dir.join("leaf.csr");
+        let ext = dir.join("leaf.ext");
+        std::fs::write(
+            &ext,
+            "subjectAltName=DNS:example.com\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n",
+        )
+        .unwrap();
+
+        let openssl = |args: &[&str]| {
+            let out = Command::new("openssl")
+                .args(args)
+                .output()
+                .expect("openssl generates the test material");
+            assert!(
+                out.status.success(),
+                "openssl {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        openssl(&[
+            "req",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-subj",
+            "/CN=example.com",
+            "-keyout",
+            key.to_str().unwrap(),
+            "-out",
+            csr.to_str().unwrap(),
+        ]);
+        openssl(&[
+            "x509",
+            "-req",
+            "-in",
+            csr.to_str().unwrap(),
+            "-CA",
+            ca.to_str().unwrap(),
+            "-CAkey",
+            ca_key.to_str().unwrap(),
+            "-set_serial",
+            "1",
+            "-days",
+            "3650",
+            "-extfile",
+            ext.to_str().unwrap(),
+            "-out",
+            cert.to_str().unwrap(),
+        ]);
+    }
+
     /// The base64 body of the first certificate in a pem document.
     fn first_pem_cert(pem: &str) -> Option<String> {
         let body = pem.split_once("-----BEGIN CERTIFICATE-----")?.1;
@@ -748,14 +825,6 @@ mod rotation {
     /// Replacing the bytes behind a client's trust anchor must rebuild the
     /// endpoint that names it — under a byte-identical description — and no
     /// other endpoint.
-    ///
-    /// IGNORED: the reconciler does plan a replacement (the digest differs),
-    /// but `Manager::apply_slot`'s no-op fast path compares built endpoints by
-    /// `Endpoint`'s `Display`, which renders a transport as its layer names
-    /// only — `transport=[plain]||[tls][plain]`. Two endpoints whose transport
-    /// configuration differs render identically, so the replacement is
-    /// collapsed back into `unchanged` and nothing is rebuilt. That fast path
-    /// is not this unit's to change; see the report.
     #[tokio::test]
     async fn rotating_a_trust_anchor_rebuilds_only_the_referencing_endpoint() {
         install_tls_provider();
@@ -808,16 +877,81 @@ mod rotation {
         );
     }
 
+    /// A `ca=` naming a file that is not there must fail that endpoint and be
+    /// reported as such. The alternative — building on the public bundle and
+    /// reporting success — is a downgrade the agent has no way to notice.
+    #[tokio::test]
+    async fn an_absent_trust_anchor_fails_only_its_own_endpoint() {
+        install_tls_provider();
+
+        let dir = TempDir::new("ca-absent");
+        let missing = dir.0.join("nowhere.pem");
+
+        let (socket, _shutdown) = serve(&dir, Reconciler::new()).await;
+        let echo = spawn_echo("v1:").await;
+        let bystander_addr = free_addr();
+
+        let (code, body) = call(
+            &socket,
+            "PUT",
+            "/v1/desired-state",
+            Some(&desired(
+                1,
+                json!([
+                    {
+                        "id": "trusting",
+                        "listen": free_addr().to_string(),
+                        "remote": echo.to_string(),
+                        "remote_transport": format!("tls;sni=example.com;ca={}", missing.display()),
+                    },
+                    { "id": "bystander", "listen": bystander_addr.to_string(), "remote": echo.to_string() },
+                ]),
+            )),
+        )
+        .await;
+
+        assert_eq!(code, 200, "a partial failure is still a processed request: {}", body);
+        assert_eq!(
+            body["state"], "partially-applied",
+            "a generation one of whose endpoints failed is partially applied: {}",
+            body
+        );
+
+        let trusting = result_for(&body, "trusting");
+        assert_eq!(
+            trusting["action"], "failed",
+            "a trust anchor that is not there must fail the endpoint: {}",
+            body
+        );
+        let error = trusting["error"].as_str().unwrap_or_else(|| panic!("{}", body));
+        assert!(
+            error.contains(&missing.display().to_string()),
+            "the reported error must name the material: {}",
+            error
+        );
+
+        assert_eq!(
+            result_for(&body, "bystander")["action"],
+            "created",
+            "one endpoint's unusable material must not fail its siblings: {}",
+            body
+        );
+
+        // the sibling is not merely reported as created, it is serving
+        let mut probe = TcpStream::connect(bystander_addr).await.unwrap();
+        probe.write_all(b"ping").await.unwrap();
+        let mut buf = vec![0u8; 64];
+        let n = timeout(Duration::from_secs(5), probe.read(&mut buf))
+            .await
+            .expect("the sibling answers")
+            .unwrap();
+        assert_eq!(&buf[..n], b"v1:ping");
+    }
+
     /// The same for a server: after the rotation the listener presents the new
-    /// leaf, which is the only thing a peer can actually observe.
-    ///
-    /// IGNORED, for two independent reasons, both outside this unit:
-    /// `Manager::apply_slot` collapses the planned replacement (see the test
-    /// above), and kaminari caches server certificate resolvers by private-key
-    /// path, so even a rebuilt acceptor would hand back the pre-rotation leaf.
-    /// This unignores once the fast path can see a transport change *and*
-    /// per-construction certificate loading lands in the fork.
-    #[ignore = "pending the pin advance: the kaminari the lockfile resolves still caches server resolvers by key path"]
+    /// leaf, which is the only thing a peer can actually observe. This is what
+    /// a resolver cached by key path would defeat: the rebuilt acceptor would
+    /// hand back the material the first construction happened to read.
     #[tokio::test]
     async fn rotating_a_leaf_makes_the_listener_present_it() {
         install_tls_provider();
@@ -871,32 +1005,46 @@ mod rotation {
     /// leave its listener serving on the material it already has — and must not
     /// record the broken state as applied.
     ///
-    /// IGNORED: nothing reads `ca=` yet, so a corrupt trust anchor is material
-    /// only the digest sees — the build cannot fail on it. The observed answer
-    /// is `unchanged`, since the planned replacement is then collapsed by the
-    /// same fast path as the test above. This unignores once `ca=` reaches the
-    /// client transport and that material is loaded per construction.
-    #[ignore = "pending the pin advance: `ca=` is not consumed by build_transport yet, so a corrupt anchor cannot fail the build"]
+    /// The peer is a second endpoint terminating tls on the very leaf the
+    /// anchor pins, so "still serving" is answered by real traffic over a
+    /// verified connection rather than by the listener merely accepting.
     #[tokio::test]
     async fn a_corrupt_anchor_fails_the_endpoint_without_disturbing_its_listener() {
         install_tls_provider();
 
         let dir = TempDir::new("ca-corrupt");
         let ca = dir.0.join("ca.pem");
-        let unused_key = dir.0.join("ca.key");
-        self_signed(&ca, &unused_key, "trusted");
+        let ca_key = dir.0.join("ca.key");
+        self_signed(&ca, &ca_key, "realm test root");
+
+        // the peer presents a leaf the anchor signed, and reads neither of the
+        // two root files: corrupting what the client trusts must leave the
+        // server's own material alone, or one rotation would fail both
+        let leaf = dir.0.join("leaf.pem");
+        let leaf_key = dir.0.join("leaf.key");
+        leaf_signed_by(&dir.0, &ca, &ca_key, &leaf, &leaf_key);
+
         let intact = std::fs::read(&ca).unwrap();
 
         let (socket, _shutdown) = serve(&dir, Reconciler::new()).await;
         let echo = spawn_echo("v1:").await;
         let laddr = free_addr();
+        let peer = free_addr();
 
-        let endpoints = json!([{
-            "id": "trusting",
-            "listen": laddr.to_string(),
-            "remote": echo.to_string(),
-            "remote_transport": format!("tls;sni=example.com;ca={}", ca.display()),
-        }]);
+        let endpoints = json!([
+            {
+                "id": "trusting",
+                "listen": laddr.to_string(),
+                "remote": peer.to_string(),
+                "remote_transport": format!("tls;sni=example.com;ca={}", ca.display()),
+            },
+            {
+                "id": "peer",
+                "listen": peer.to_string(),
+                "remote": echo.to_string(),
+                "listen_transport": format!("tls;cert={};key={}", leaf.display(), leaf_key.display()),
+            },
+        ]);
 
         let (code, body) = call(
             &socket,
@@ -907,6 +1055,7 @@ mod rotation {
         .await;
         assert_eq!(code, 200, "{}", body);
         assert_eq!(result_for(&body, "trusting")["action"], "created");
+        assert_eq!(result_for(&body, "peer")["action"], "created");
 
         let mut established = TcpStream::connect(laddr).await.unwrap();
 
@@ -957,16 +1106,11 @@ mod rotation {
     /// read today: a rebuild that cannot produce a working endpoint fails that
     /// endpoint, keeps the running listener, and is not recorded as applied.
     ///
-    /// IGNORED: the first two thirds hold — the endpoint fails and the listener
-    /// keeps presenting its leaf — but kaminari reads certificates behind a
-    /// `lazy_static` mutex and *panics* on unusable material while holding it.
-    /// The mutex is then poisoned for the life of the process, so every later
-    /// server construction panics too, including the one that should have been
-    /// reported `unchanged`. That also makes the test contaminate every other
-    /// tls test in this binary, which is the second reason it stays out of the
-    /// default run. It unignores once certificate construction is fallible in
-    /// the fork.
-    #[ignore = "pending the pin advance: the kaminari the lockfile resolves still panics inside its resolver mutex, poisoning it process-wide"]
+    /// The last third is the one that needs construction to return an error
+    /// rather than panic: a panic taken inside the shared resolver mutex used
+    /// to poison it for the life of the process, which failed every later
+    /// server construction in this binary, including this test's own final
+    /// `unchanged`.
     #[tokio::test]
     async fn a_failed_rebuild_leaves_the_serving_listener_alone() {
         install_tls_provider();
@@ -976,8 +1120,8 @@ mod rotation {
         let key = dir.0.join("key.pem");
         self_signed(&cert, &key, "serving");
 
-        // kaminari caches resolvers by key path, so unusable material only
-        // reaches the acceptor under a path it has not seen
+        // unusable material under a path of its own: the rebuild has to be
+        // driven by a change in the description, not only in the bytes
         let broken_cert = dir.0.join("broken.pem");
         let broken_key = dir.0.join("broken.key");
         std::fs::write(&broken_cert, b"this is not a certificate").unwrap();

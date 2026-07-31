@@ -1208,7 +1208,7 @@ dependencies = [
 [[package]]
 name = "kaminari"
 version = "0.14.0"
-source = "git+https://github.com/1m1ng/kaminari.git?rev=b8c6e620f4c25f8bebb3aead7a3259535999f3dc#b8c6e620f4c25f8bebb3aead7a3259535999f3dc"
+source = "git+https://github.com/1m1ng/kaminari.git?rev=d500264a5652cd5ea764949129118865a493c6aa#d500264a5652cd5ea764949129118865a493c6aa"
 dependencies = [
  "aws-lc-rs",
  "lazy_static",
