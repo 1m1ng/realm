@@ -62,6 +62,7 @@ impl EndpointSource for TestSpec {
             tcp: true,
             udp: false,
             drain: None,
+            material: None,
         })
     }
 

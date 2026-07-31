@@ -112,6 +112,7 @@ impl EndpointSource for TestSpec {
             tcp: self.tcp,
             udp: self.udp,
             drain,
+            material: None,
         })
     }
 
@@ -958,6 +959,7 @@ impl EndpointSource for PanicSpec {
             tcp: true,
             udp: false,
             drain: None,
+            material: None,
         })
     }
 }

@@ -30,6 +30,7 @@ fn spec(laddr: SocketAddr, remote: SocketAddr) -> EndpointSpec {
         tcp: true,
         udp: false,
         drain: None,
+        material: None,
     }
 }
 

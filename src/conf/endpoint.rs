@@ -63,6 +63,30 @@ pub struct EndpointConf {
     #[serde(default)]
     #[serde(skip_serializing_if = "Config::is_empty")]
     pub network: NetConf,
+
+    /// digest of the certificate material the transport options name, as of
+    /// the last `refresh`; absent when they name none
+    ///
+    /// Not part of the configuration document, and deliberately so. The
+    /// reconciler rebuilds an endpoint only when its desired state differs
+    /// from the active generation's, and that state is this struct: replacing
+    /// the *bytes* of a certificate file leaves every other field identical,
+    /// so a rotation in place would be invisible and the endpoint would keep
+    /// serving pre-rotation material while the control plane reported
+    /// convergence. Folding the material into the value makes the rotation a
+    /// difference the diff can see.
+    ///
+    /// `#[serde(skip)]` is what keeps that from breaking the other half of
+    /// the contract: the submission hash and the replay decision go through
+    /// serde, so a genuine retry of a byte-identical document is still a
+    /// replay, and an agent neither sends this nor sees it.
+    ///
+    /// An endpoint that names no material keeps this absent rather than
+    /// digesting emptiness, so it is identical whether it has been refreshed
+    /// or not — a refresh that never ran, because the blocking pool refused
+    /// it, leaves such an endpoint exactly where a refresh would have.
+    #[serde(skip)]
+    pub material_digest: Option<u64>,
 }
 
 impl EndpointConf {
@@ -332,6 +356,7 @@ impl Config for EndpointConf {
             balance: None,
             update_drain_timeout: None,
             delete_drain_timeout: None,
+            material_digest: None,
         }
     }
 }
@@ -348,6 +373,88 @@ impl EndpointConf {
         conf
     }
 
+    /// Largest piece of certificate material that is read for the digest.
+    ///
+    /// A certificate, a key, or a whole trust bundle is small. An operator who
+    /// points `ca=` at something huge — by accident or otherwise — must not be
+    /// able to make the reconciler read all of it on every submission, so
+    /// anything past this cap is digested as unreadable instead.
+    #[cfg(feature = "transport")]
+    const MAX_MATERIAL_BYTES: u64 = 1024 * 1024;
+
+    /// Digest of the certificate material this endpoint's transport options
+    /// name: `cert` and `key` on the listen side, `ca` on the remote side.
+    ///
+    /// The options are read with kaminari's own `has_opt!`/`get_opt!`, so the
+    /// digest's view of a transport string is exactly the view the constructor
+    /// gets — a second parser here would drift from the one that decides what
+    /// is actually loaded, and the digest would then track material the
+    /// endpoint does not use. That includes the `tls` gate: without it the
+    /// constructor never looks at these options, so neither does this.
+    ///
+    /// Each path is hashed together with its contents, and a path that cannot
+    /// be read is marked as such rather than skipped: material appearing,
+    /// disappearing, or moving to a different file is a change to the desired
+    /// state just as much as a change to its bytes.
+    ///
+    /// `ocsp` is deliberately absent. A stapled response has its own lifetime
+    /// and is refreshed far more often than the certificate it belongs to;
+    /// including it would rebuild the endpoint on that cadence.
+    #[cfg(feature = "transport")]
+    fn digest_material(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        use realm_core::kaminari::opt::{get_opt, has_opt};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut any = false;
+
+        for (field, option, transport) in [
+            ("listen_transport", "cert", &self.listen_transport),
+            ("listen_transport", "key", &self.listen_transport),
+            ("remote_transport", "ca", &self.remote_transport),
+        ] {
+            field.hash(&mut hasher);
+            option.hash(&mut hasher);
+
+            let tls = transport.as_deref().filter(|s| has_opt!(*s => "tls"));
+
+            let Some(path) = tls.and_then(|s| get_opt!(s => option)) else {
+                // the option is absent: no material, and that is itself a state
+                MaterialTag::Absent.hash(&mut hasher);
+                continue;
+            };
+
+            any = true;
+            MaterialTag::Named.hash(&mut hasher);
+            path.hash(&mut hasher);
+
+            match Self::read_material(path) {
+                Some(bytes) => {
+                    MaterialTag::Read.hash(&mut hasher);
+                    bytes.hash(&mut hasher);
+                }
+                None => MaterialTag::Unreadable.hash(&mut hasher),
+            }
+        }
+
+        any.then(|| hasher.finish())
+    }
+
+    /// The contents of `path`, or `None` if it cannot be read or holds more
+    /// than [`Self::MAX_MATERIAL_BYTES`].
+    #[cfg(feature = "transport")]
+    fn read_material(path: &str) -> Option<Vec<u8>> {
+        use std::io::Read;
+
+        let file = std::fs::File::open(path).ok()?;
+        let mut bytes = Vec::new();
+        // one byte past the cap, so a file that sits exactly on it is still
+        // told apart from one that overruns it
+        file.take(Self::MAX_MATERIAL_BYTES + 1).read_to_end(&mut bytes).ok()?;
+
+        (bytes.len() as u64 <= Self::MAX_MATERIAL_BYTES).then_some(bytes)
+    }
+
     /// Drain deadlines this endpoint overrides, if any (R13, R15).
     fn drain_policy(&self) -> Option<DrainPolicy> {
         if self.update_drain_timeout.is_none() && self.delete_drain_timeout.is_none() {
@@ -362,6 +469,21 @@ impl EndpointConf {
     }
 }
 
+/// What the digest found at one certificate option, so that "absent",
+/// "unreadable" and "empty file" cannot collapse into the same digest.
+#[cfg(feature = "transport")]
+#[derive(Hash)]
+enum MaterialTag {
+    /// the transport string does not carry the option at all
+    Absent,
+    /// the option names a path
+    Named,
+    /// the path was read, and its contents follow
+    Read,
+    /// the path could not be read, or holds more than the cap allows
+    Unreadable,
+}
+
 impl EndpointSource for EndpointConf {
     fn build(&self) -> Result<EndpointSpec, String> {
         let drain = self.drain_policy();
@@ -372,6 +494,18 @@ impl EndpointSource for EndpointConf {
             tcp: !info.no_tcp,
             udp: info.use_udp,
             drain,
+            material: self.material_digest,
         })
+    }
+
+    fn refresh(&mut self) {
+        // Only a build with transports can name certificate material, and only
+        // such a build has kaminari to read the option strings the same way the
+        // constructor does. Elsewhere the digest stays at its default, so it
+        // never contributes a difference to the diff.
+        #[cfg(feature = "transport")]
+        {
+            self.material_digest = self.digest_material();
+        }
     }
 }

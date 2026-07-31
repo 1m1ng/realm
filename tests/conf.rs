@@ -8,6 +8,7 @@ use std::io::Write;
 use std::process::Command;
 
 use realm::conf::{Config, EndpointConf, FullConf};
+use realm::core::lifecycle::EndpointSource;
 
 fn parse(conf: &str) -> FullConf {
     FullConf::from_conf_str(conf).expect("config text should parse")
@@ -264,4 +265,309 @@ listen_transport = "ws;host=example.com;path=/tunnel"
     );
 
     ep.build().expect("a well-formed transport value must still build");
+}
+
+// The reconciler rebuilds an endpoint only when its desired state differs from
+// the active generation's, and that state is the configuration document.
+// Replacing the *bytes* of a certificate file leaves every field of the
+// document identical, so a rotation in place would be invisible: the endpoint
+// would go on serving pre-rotation material while the control plane reported
+// convergence. `EndpointSource::refresh` folds the contents of the files the
+// transport options name into the value itself, so a rotation becomes a
+// difference the diff can see — and, because the field is invisible to serde,
+// one the submission hash still cannot see.
+
+fn plain_endpoint() -> EndpointConf {
+    single_endpoint(
+        r#"
+[[endpoints]]
+listen = "127.0.0.1:10000"
+remote = "127.0.0.1:20000"
+"#,
+    )
+}
+
+#[test]
+fn an_endpoint_naming_no_material_never_forces_a_rebuild() {
+    let submitted = plain_endpoint();
+
+    let mut refreshed = submitted.clone();
+    refreshed.refresh();
+    assert_eq!(
+        submitted, refreshed,
+        "an endpoint that names no certificate material must not change under refresh"
+    );
+
+    let mut again = refreshed.clone();
+    again.refresh();
+    assert_eq!(refreshed, again, "the digest must be stable across refreshes");
+}
+
+#[test]
+fn the_digest_is_not_part_of_the_configuration_document() {
+    let mut ep = plain_endpoint();
+    ep.refresh();
+
+    let document = serde_json::to_value(&ep).expect("an endpoint serializes");
+    let keys: Vec<&String> = document
+        .as_object()
+        .expect("an endpoint is a json object")
+        .keys()
+        .collect();
+    assert!(
+        !keys.iter().any(|k| k.contains("digest")),
+        "the digest must not appear in the configuration document: {:?}",
+        keys
+    );
+
+    // a document that carries no digest — every document an agent sends —
+    // still deserializes
+    let restored: EndpointConf = serde_json::from_value(document).expect("a document without a digest deserializes");
+    assert_eq!(restored.listen, ep.listen);
+    assert_eq!(restored.remote, ep.remote);
+}
+
+#[cfg(feature = "transport")]
+mod material {
+    use super::*;
+
+    use std::path::{Path, PathBuf};
+
+    /// A private directory for one test's certificate material, removed on drop.
+    struct MaterialDir(PathBuf);
+
+    impl MaterialDir {
+        fn new(name: &str) -> Self {
+            let mut path = std::env::temp_dir();
+            path.push(format!("realm-material-{}-{}", name, std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn write(&self, name: &str, content: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, content).unwrap();
+            path
+        }
+    }
+
+    impl Drop for MaterialDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A toml basic string: `Debug` escapes exactly what toml needs, so a
+    /// windows path with backslashes survives being embedded in a document.
+    fn quoted(s: &str) -> String {
+        format!("{:?}", s)
+    }
+
+    fn refreshed(conf: &str) -> EndpointConf {
+        let mut ep = single_endpoint(conf);
+        ep.refresh();
+        ep
+    }
+
+    /// A client endpoint whose trust anchor is `ca`.
+    fn client_endpoint(ca: &Path) -> EndpointConf {
+        refreshed(&format!(
+            r#"
+[[endpoints]]
+listen = "127.0.0.1:10000"
+remote = "127.0.0.1:20000"
+remote_transport = {}
+"#,
+            quoted(&format!("tls;sni=example.com;ca={}", ca.display()))
+        ))
+    }
+
+    /// A server endpoint presenting `cert` and `key`.
+    fn server_endpoint(cert: &Path, key: &Path) -> EndpointConf {
+        refreshed(&format!(
+            r#"
+[[endpoints]]
+listen = "127.0.0.1:10000"
+remote = "127.0.0.1:20000"
+listen_transport = {}
+"#,
+            quoted(&format!("tls;cert={};key={}", cert.display(), key.display()))
+        ))
+    }
+
+    #[test]
+    fn replacing_the_ca_bytes_changes_the_desired_state() {
+        let dir = MaterialDir::new("ca-bytes");
+        let ca = dir.write(
+            "ca.pem",
+            "-----BEGIN CERTIFICATE-----\nbefore\n-----END CERTIFICATE-----\n",
+        );
+
+        let before = client_endpoint(&ca);
+
+        dir.write(
+            "ca.pem",
+            "-----BEGIN CERTIFICATE-----\nafter\n-----END CERTIFICATE-----\n",
+        );
+        let after = client_endpoint(&ca);
+
+        assert_ne!(
+            before, after,
+            "a trust anchor replaced in place must change the endpoint's desired state"
+        );
+    }
+
+    #[test]
+    fn replacing_the_cert_bytes_changes_the_desired_state() {
+        let dir = MaterialDir::new("cert-bytes");
+        let cert = dir.write("cert.pem", "leaf before\n");
+        let key = dir.write("key.pem", "key\n");
+
+        let before = server_endpoint(&cert, &key);
+
+        dir.write("cert.pem", "leaf after\n");
+        let after = server_endpoint(&cert, &key);
+
+        assert_ne!(
+            before, after,
+            "a leaf certificate replaced in place must change the endpoint's desired state"
+        );
+    }
+
+    #[test]
+    fn replacing_the_key_bytes_changes_the_desired_state() {
+        let dir = MaterialDir::new("key-bytes");
+        let cert = dir.write("cert.pem", "leaf\n");
+        let key = dir.write("key.pem", "key before\n");
+
+        let before = server_endpoint(&cert, &key);
+
+        dir.write("key.pem", "key after\n");
+        let after = server_endpoint(&cert, &key);
+
+        assert_ne!(
+            before, after,
+            "a private key replaced in place must change the endpoint's desired state"
+        );
+    }
+
+    #[test]
+    fn untouched_material_leaves_the_desired_state_alone() {
+        let dir = MaterialDir::new("untouched");
+        let ca = dir.write("ca.pem", "anchor\n");
+        let cert = dir.write("cert.pem", "leaf\n");
+        let key = dir.write("key.pem", "key\n");
+
+        assert_eq!(
+            client_endpoint(&ca),
+            client_endpoint(&ca),
+            "material nobody touched must not churn a running endpoint"
+        );
+        assert_eq!(
+            server_endpoint(&cert, &key),
+            server_endpoint(&cert, &key),
+            "material nobody touched must not churn a running endpoint"
+        );
+    }
+
+    #[test]
+    fn material_that_disappears_changes_the_desired_state() {
+        let dir = MaterialDir::new("deleted");
+        let ca = dir.write("ca.pem", "anchor\n");
+
+        let before = client_endpoint(&ca);
+
+        std::fs::remove_file(&ca).unwrap();
+        let after = client_endpoint(&ca);
+
+        assert_ne!(
+            before, after,
+            "a trust anchor that disappeared must change the endpoint's desired state"
+        );
+    }
+
+    #[test]
+    fn material_the_constructor_never_reads_is_not_digested() {
+        // kaminari looks at `cert`/`key` only when the string carries `tls`, so
+        // here it loads nothing. A file the endpoint never reads must not churn
+        // it: the digest parses the string the way the constructor does.
+        let dir = MaterialDir::new("no-tls");
+        let cert = dir.write("cert.pem", "leaf before\n");
+
+        let transport = quoted(&format!("ws;host=example.com;path=/x;cert={}", cert.display()));
+        let conf = format!(
+            r#"
+[[endpoints]]
+listen = "127.0.0.1:10000"
+remote = "127.0.0.1:20000"
+listen_transport = {}
+"#,
+            transport
+        );
+
+        let before = refreshed(&conf);
+        dir.write("cert.pem", "leaf after\n");
+        let after = refreshed(&conf);
+
+        assert_eq!(
+            before, after,
+            "material no transport loads must not change the desired state"
+        );
+    }
+
+    #[test]
+    fn the_same_bytes_at_a_different_path_change_the_desired_state() {
+        let dir = MaterialDir::new("moved");
+        let here = dir.write("here.pem", "anchor\n");
+        let there = dir.write("there.pem", "anchor\n");
+
+        assert_ne!(
+            client_endpoint(&here),
+            client_endpoint(&there),
+            "the path is part of the material's identity"
+        );
+    }
+
+    #[test]
+    fn a_refreshed_digest_does_not_travel_through_serde() {
+        let dir = MaterialDir::new("serde");
+        let ca = dir.write("ca.pem", "anchor\n");
+
+        let refreshed = client_endpoint(&ca);
+        let document = serde_json::to_value(&refreshed).expect("an endpoint serializes");
+        let restored: EndpointConf = serde_json::from_value(document).expect("an endpoint deserializes");
+
+        // The submission hash goes through serde, so the digest has to be
+        // invisible to it: a byte-identical resubmission must still replay.
+        let mut submitted = restored.clone();
+        submitted.refresh();
+        assert_eq!(
+            refreshed, submitted,
+            "a restored document must reach the same digest once refreshed"
+        );
+        assert_ne!(refreshed, restored, "the digest must not survive a serde round trip");
+    }
+
+    #[test]
+    fn material_beyond_the_read_cap_is_treated_as_unreadable() {
+        let dir = MaterialDir::new("oversized");
+        let ca = dir.write("ca.pem", "anchor\n");
+        let readable = client_endpoint(&ca);
+
+        // A certificate bundle is small. An operator pointing `ca=` at a huge
+        // file must not make the reconciler read all of it, so anything past
+        // the cap is the unreadable case — and two files nobody can read look
+        // alike, whatever their contents.
+        dir.write("ca.pem", &"a".repeat(4 * 1024 * 1024 + 1));
+        let first = client_endpoint(&ca);
+        dir.write("ca.pem", &"b".repeat(4 * 1024 * 1024 + 2));
+        let second = client_endpoint(&ca);
+
+        assert_ne!(readable, first, "material that went over the cap is a change");
+        assert_eq!(
+            first, second,
+            "a path past the read cap must digest as unreadable, not as its contents"
+        );
+    }
 }
