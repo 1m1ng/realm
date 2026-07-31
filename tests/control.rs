@@ -185,6 +185,43 @@ async fn version_reports_the_contract_and_capabilities() {
     let (code, same) = call(&socket, "GET", "/v1/capabilities", None).await;
     assert_eq!(code, 200);
     assert_eq!(same["schema_version"], body["schema_version"]);
+    assert_eq!(same, body, "both routes must answer the same document");
+
+    // The version the binary reports is the manifest's, so the release tag,
+    // Cargo.toml and `realm --version` cannot drift apart -- the consuming
+    // control plane pins all three as one identity.
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+}
+
+/// The capability literal is a contract with the consuming control plane,
+/// which asserts the same string on its side. Spelled out here rather than
+/// looped over `CAPABILITIES`, because a loop over the constant renames itself
+/// along with the constant and would let a divergence through: the consuming
+/// fleet would then resolve to not-capable with both sides' tests green.
+///
+/// An older binary does not reject `ca=` -- unknown transport options are
+/// ignored -- so there is no error to detect the feature's absence by. This
+/// token is the only signal.
+#[tokio::test]
+async fn the_client_ca_capability_token_is_exactly_as_the_consumer_expects() {
+    let dir = TempDir::new("capability-literal");
+    let (socket, _shutdown) = serve(&dir, Reconciler::new()).await;
+
+    let (code, body) = call(&socket, "GET", "/v1/capabilities", None).await;
+    assert_eq!(code, 200);
+
+    let advertised: Vec<&str> = body["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+
+    assert!(
+        advertised.contains(&"client-ca-verify"),
+        "the capability token must be spelled exactly `client-ca-verify`, got {:?}",
+        advertised
+    );
 }
 
 /// Covers AE14 over http (R6, R11, R36): a desired state applied over the

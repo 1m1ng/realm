@@ -35,6 +35,18 @@ pub const CAPABILITIES: &[&str] = &[
     "per-endpoint-drain-timeout",
     "draining-cohort-status",
     "snapshot-restore",
+    // A caller may point a `remote_transport` at a private trust anchor with
+    // `ca=<path>`, and replacing that file's bytes — or a server `cert`/`key`
+    // pair's — is a change the next generation converges on.
+    //
+    // This literal is a contract with the consuming control plane, which
+    // asserts it by test on its side. A divergence resolves that plane's whole
+    // fleet to not-capable with green tests on both ends, so it is not a string
+    // to tidy up. It exists because an older binary silently *ignores* `ca=`
+    // and falls through to public-root verification: there is no error to
+    // detect the absence by, which is exactly why the capability is advertised
+    // rather than inferred from a version.
+    "client-ca-verify",
 ];
 
 /// Largest request body accepted, so the control plane cannot be made to
