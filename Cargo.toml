@@ -15,6 +15,18 @@ members = [
 ]
 
 
+# realm needs a client-side `ca=` transport option and per-construction
+# certificate loading, neither of which upstream kaminari has. The fork
+# freezes at 0.14.0 and is pinned to an immutable revision so the build is
+# reproducible; `Cargo.lock` must record kaminari with a `git+` source, never
+# the registry crate. An unapplied patch is only a cargo *warning* -- the tree
+# would silently fall back to the registry, `ca=` would become an ignored
+# option again, and every client would revert to public-root verification. CI
+# fails the build on that, see the patch-integrity gate in ci.yml.
+[patch.crates-io]
+kaminari = { git = "https://github.com/1m1ng/kaminari.git", rev = "b8c6e620f4c25f8bebb3aead7a3259535999f3dc" }
+
+
 [lib]
 name = "realm"
 path = "src/lib.rs"

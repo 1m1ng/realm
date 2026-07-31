@@ -1208,8 +1208,7 @@ dependencies = [
 [[package]]
 name = "kaminari"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2546fd61ce52ddfbe635992d3305cc6a182e2c6d7de208850847265186096dce"
+source = "git+https://github.com/1m1ng/kaminari.git?rev=b8c6e620f4c25f8bebb3aead7a3259535999f3dc#b8c6e620f4c25f8bebb3aead7a3259535999f3dc"
 dependencies = [
  "aws-lc-rs",
  "lazy_static",
