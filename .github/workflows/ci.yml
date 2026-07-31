@@ -7,6 +7,49 @@ on:
     paths-ignore: ["**.md"]
     branches: [master]
 jobs:
+  # A `[patch.crates-io]` entry that stops applying is a cargo *warning*, not an
+  # error: the tree falls back to the registry crate, `ca=` becomes an ignored
+  # transport option again, and every client silently reverts to public-root
+  # verification with nothing failing to point at the cause. So the pin is a
+  # standing gate, not a one-shot check -- it compares Cargo.lock against
+  # Cargo.toml rather than against a hardcoded revision, so advancing the pin
+  # keeps the gate honest without editing it.
+  patch-integrity:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: kaminari resolves to the pinned fork revision
+        run: |
+          set -euo pipefail
+
+          # `rev = "..."` inside the [patch.crates-io] table
+          want=$(sed -n '/^\[patch\.crates-io\]/,/^\[/p' Cargo.toml \
+                 | sed -n 's/^kaminari *=.*rev *= *"\([0-9a-f]\{40\}\)".*/\1/p')
+          if [ -z "$want" ]; then
+            echo "::error::Cargo.toml has no [patch.crates-io] kaminari entry pinned to a 40-char revision"
+            exit 1
+          fi
+
+          # the `source = "..."` line of Cargo.lock's kaminari package
+          got=$(awk '/^name = "kaminari"$/ {found=1} found && /^source = / {print; exit}' Cargo.lock)
+          if [ -z "$got" ]; then
+            echo "::error::Cargo.lock has no source line for kaminari"
+            exit 1
+          fi
+
+          case "$got" in
+            *"git+"*"?rev=$want"*) ;;
+            *)
+              echo "::error::the kaminari patch is not applied -- Cargo.lock resolved to:"
+              echo "  $got"
+              echo "expected a git+ source at rev $want. Every client would fall back to"
+              echo "public-root verification with ca= silently ignored."
+              exit 1
+              ;;
+          esac
+
+          echo "kaminari pinned to $want"
+
   clippy:
     runs-on: >-
       ${{  
