@@ -227,6 +227,19 @@ impl EndpointConf {
             })
         }
 
+        // `guard`'s sibling for the half of the failures that are *returned*
+        // rather than thrown: construction reads the certificate material the
+        // options name, and kaminari's error already says which file or value
+        // it choked on. Same field/value/reason shape either way, so an
+        // operator cannot tell which mechanism reported the problem.
+        fn returned<T, E: std::fmt::Display>(
+            field: &'static str,
+            value: &Option<String>,
+            result: Result<T, E>,
+        ) -> Result<T, BuildError> {
+            result.map_err(|e| BuildError::new(field, value.as_deref().unwrap_or_default(), e.to_string()))
+        }
+
         let listen_ws = guard("listen_transport", listen_transport, || {
             listen_transport.as_ref().and_then(|s| get_ws_conf(s))
         })?;
@@ -258,28 +271,22 @@ impl EndpointConf {
             // kaminari's error already names the file or the value it choked
             // on, which is what the operator needs; the field name is what
             // says which of the two transport strings it came from.
-            let ac = MixAccept::new_shared(MixServerConf {
-                ws: listen_ws,
-                tls: listen_tls,
-            })
-            .map_err(|e| {
-                BuildError::new(
-                    "listen_transport",
-                    listen_transport.as_deref().unwrap_or_default(),
-                    e.to_string(),
-                )
-            })?;
-            let cc = MixConnect::new_shared(MixClientConf {
-                ws: remote_ws,
-                tls: remote_tls,
-            })
-            .map_err(|e| {
-                BuildError::new(
-                    "remote_transport",
-                    remote_transport.as_deref().unwrap_or_default(),
-                    e.to_string(),
-                )
-            })?;
+            let ac = returned(
+                "listen_transport",
+                listen_transport,
+                MixAccept::new_shared(MixServerConf {
+                    ws: listen_ws,
+                    tls: listen_tls,
+                }),
+            )?;
+            let cc = returned(
+                "remote_transport",
+                remote_transport,
+                MixConnect::new_shared(MixClientConf {
+                    ws: remote_ws,
+                    tls: remote_tls,
+                }),
+            )?;
             Ok(Some((ac, cc)))
         }
     }

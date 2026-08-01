@@ -919,7 +919,12 @@ async fn a_generation_resubmitted_after_its_material_rotated_is_refused() {
 struct PanicSpec {
     listen: String,
     remote: SocketAddr,
+    /// poison the comparison the reconciler makes while diffing
     panic_on_eq: bool,
+    /// poison the derived-state refresh instead, so the failure lands on a
+    /// different call site with the same "one endpoint, not the reconciler"
+    /// expectation
+    panic_on_refresh: bool,
 }
 
 impl PartialEq for PanicSpec {
@@ -932,6 +937,12 @@ impl PartialEq for PanicSpec {
 }
 
 impl EndpointSource for PanicSpec {
+    fn refresh(&mut self) {
+        if self.panic_on_refresh {
+            panic!("boom: refreshing a poisoned spec");
+        }
+    }
+
     fn build(&self) -> Result<EndpointSpec, String> {
         let laddr: SocketAddr = self.listen.parse().map_err(|e| format!("bad listen: {}", e))?;
         Ok(EndpointSpec {
@@ -963,6 +974,7 @@ async fn a_panic_handling_one_request_does_not_kill_the_reconciler() {
         listen: listen.to_string(),
         remote: echo,
         panic_on_eq,
+        panic_on_refresh: false,
     };
     let one = |id: &str, spec: PanicSpec| ReconcileRequest {
         generation: 0,
@@ -1016,39 +1028,6 @@ async fn a_panic_handling_one_request_does_not_kill_the_reconciler() {
     );
 }
 
-/// A description whose `refresh` panics. A hook that cannot run leaves the
-/// derived state at its default on one side of the comparison while the applied
-/// side still carries the real value, so silently continuing would tear the
-/// endpoint down for a reason that has nothing to do with its material.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct PanicRefreshSpec {
-    listen: String,
-    remote: SocketAddr,
-}
-
-impl EndpointSource for PanicRefreshSpec {
-    fn build(&self) -> Result<EndpointSpec, String> {
-        let laddr: SocketAddr = self.listen.parse().map_err(|e| format!("bad listen: {}", e))?;
-        Ok(EndpointSpec {
-            endpoint: Endpoint {
-                laddr,
-                raddr: RemoteAddr::SocketAddr(self.remote),
-                bind_opts: Default::default(),
-                conn_opts: Default::default(),
-                extra_raddrs: Vec::new(),
-            },
-            tcp: true,
-            udp: false,
-            drain: None,
-            material: None,
-        })
-    }
-
-    fn refresh(&mut self) {
-        panic!("boom: refreshing a poisoned spec");
-    }
-}
-
 #[tokio::test]
 async fn an_endpoint_whose_refresh_panics_fails_alone() {
     let echo = spawn_echo("v1:").await;
@@ -1060,9 +1039,11 @@ async fn an_endpoint_whose_refresh_panics_fails_alone() {
             generation: 1,
             endpoints: vec![DesiredEndpoint {
                 id: "a".into(),
-                spec: PanicRefreshSpec {
+                spec: PanicSpec {
                     listen: a.to_string(),
                     remote: echo,
+                    panic_on_eq: false,
+                    panic_on_refresh: true,
                 },
             }],
         })
