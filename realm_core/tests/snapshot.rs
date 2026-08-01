@@ -5,9 +5,7 @@
 //! agent's next reconcile. The snapshot is written atomically, and restoring it
 //! reuses the partially-applied semantics when some endpoint cannot come back.
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
@@ -19,18 +17,7 @@ use realm_core::lifecycle::{
 };
 
 mod common;
-use common::{TempDir, ask, free_addr, spawn_echo};
-
-/// Material realm does not own, standing in for a certificate file on disk,
-/// keyed by listen address so parallel tests never share an entry. It is what
-/// `refresh` reads, it decides where the built endpoint really forwards, and it
-/// can be rewritten while realm is down.
-static MATERIAL: Mutex<BTreeMap<String, SocketAddr>> = Mutex::new(BTreeMap::new());
-
-/// Rewrite the material behind an endpoint, as a certificate rotation would.
-fn rotate_material(listen: &SocketAddr, remote: SocketAddr) {
-    MATERIAL.lock().unwrap().insert(listen.to_string(), remote);
-}
+use common::{TempDir, ask, free_addr, rotate_material, spawn_echo};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct TestSpec {
@@ -67,7 +54,7 @@ impl EndpointSource for TestSpec {
     }
 
     fn refresh(&mut self) {
-        self.material = MATERIAL.lock().unwrap().get(&self.listen).copied();
+        self.material = common::material_for(&self.listen);
     }
 }
 

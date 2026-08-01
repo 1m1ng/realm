@@ -6,8 +6,10 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -94,6 +96,28 @@ pub fn free_addr() -> SocketAddr {
         }
     }
     panic!("no free port in the test range");
+}
+
+/// Material realm does not own, standing in for a certificate file on disk.
+///
+/// The lifecycle tests rewrite it in place without touching any field of the
+/// description they submit, and their `EndpointSource::refresh` reads it into a
+/// field serde cannot see. What it holds decides where the built endpoint
+/// actually forwards, so a rotation that never reached the endpoint shows up in
+/// the data path rather than only in a reported action string.
+///
+/// Keyed by listen address, which `free_addr` above makes unique per test, so
+/// tests running in parallel in one binary never share an entry.
+static MATERIAL: Mutex<BTreeMap<String, SocketAddr>> = Mutex::new(BTreeMap::new());
+
+/// Rewrite the material behind an endpoint, as a certificate rotation would.
+pub fn rotate_material(listen: &SocketAddr, remote: SocketAddr) {
+    MATERIAL.lock().unwrap().insert(listen.to_string(), remote);
+}
+
+/// What the material behind `listen` currently says, for a `refresh` impl.
+pub fn material_for(listen: &str) -> Option<SocketAddr> {
+    MATERIAL.lock().unwrap().get(listen).copied()
 }
 
 /// Send and read back one answer, failing the test if the relay stalls.

@@ -22,25 +22,11 @@ use realm_core::lifecycle::{
 };
 
 mod common;
-use common::{ask, free_addr, spawn_echo};
+use common::{ask, free_addr, rotate_material, spawn_echo};
 
-/// Material realm does not own, standing in for a certificate file on disk:
-/// the tests rewrite it in place without touching any field of the
-/// description, and `TestSpec::refresh` reads it into a field serde cannot see.
-/// What it holds decides where the built endpoint actually forwards, so a
-/// rotation that never reaches the built endpoint is visible in the data path.
-///
-/// Keyed by listen address, which is unique per test, so tests running in
-/// parallel in one binary never share an entry.
-static MATERIAL: Mutex<BTreeMap<String, SocketAddr>> = Mutex::new(BTreeMap::new());
-
-/// How many times `refresh` ran, per listen address.
+/// How many times `refresh` ran, per listen address. Unlike the material store
+/// in `common`, only this file asserts on it.
 static REFRESHES: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
-
-/// Rewrite the material behind an endpoint, as a certificate rotation would.
-fn rotate_material(listen: &SocketAddr, remote: SocketAddr) {
-    MATERIAL.lock().unwrap().insert(listen.to_string(), remote);
-}
 
 /// How many times the reconciler refreshed the endpoint listening here.
 fn refreshes(listen: &SocketAddr) -> usize {
@@ -118,7 +104,7 @@ impl EndpointSource for TestSpec {
 
     fn refresh(&mut self) {
         *REFRESHES.lock().unwrap().entry(self.listen.clone()).or_default() += 1;
-        self.material = MATERIAL.lock().unwrap().get(&self.listen).copied();
+        self.material = common::material_for(&self.listen);
     }
 }
 

@@ -307,6 +307,13 @@ impl<S: EndpointSource> Reconciler<S> {
         // generation for different desired states must not both be told the
         // first one succeeded, so a same-generation content mismatch is a
         // terminal conflict rather than a false replay.
+        //
+        // An endpoint that could not be refreshed skips this path entirely
+        // rather than being judged by it. Both answers here rest on comparing
+        // derived state, and that endpoint's is a default value rather than
+        // what is on disk — it would read as drift where there is none, or
+        // hide drift that is real. Falling through to the diff instead fails
+        // that one endpoint and answers the rest normally.
         if self.active == Some(generation) && unrefreshed.is_empty() {
             match &self.last {
                 Some(last) if self.last_digest == Some(digest) => {
