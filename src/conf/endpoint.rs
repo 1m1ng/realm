@@ -131,7 +131,7 @@ impl EndpointConf {
 
         // `realm_lb::Strategy::from` panics on anything but these; validate the
         // token before `parse_from_str` reaches it, so a control-plane request
-        // cannot panic the reconciler (finding #2)
+        // cannot panic the reconciler
         if !matches!(strategy.trim(), "off" | "iphash" | "roundrobin") {
             return Err(BuildError::new(
                 "balance",
@@ -190,7 +190,7 @@ impl EndpointConf {
         // when `ws` is present but host/path are missing, `get_tls_*_conf` when
         // `tls` is present but sni/cert are missing). Since this runs on the
         // reconciler task for a control-plane request, a panic would take the
-        // whole control plane down (finding #2) — so any panic is caught here
+        // whole control plane down, so any panic is caught here
         // and turned into a structured error naming the field.
         fn guard<T>(field: &'static str, value: &Option<String>, f: impl FnOnce() -> T) -> Result<T, BuildError> {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|e| {

@@ -237,7 +237,7 @@ fn the_snapshot_is_owner_only() {
     assert_eq!(mode, 0o600, "the snapshot must not be readable by others");
 }
 
-/// Finding #1: the temporary file must never be written through a pre-planted
+/// The temporary file must never be written through a pre-planted
 /// symlink. A local user who can create a name in the state directory must not
 /// be able to make realm clobber an arbitrary file with realm's (typically
 /// root) privileges.
@@ -287,7 +287,7 @@ fn the_snapshot_temp_file_does_not_follow_a_symlink() {
     assert_eq!(loaded.endpoints.len(), 1);
 }
 
-/// Finding #1 (happy path): a plain store still round-trips through load with
+/// A plain store still round-trips through load with
 /// the hardened, unique-name temp file.
 #[test]
 fn a_plain_store_round_trips() {
@@ -315,7 +315,7 @@ fn a_plain_store_round_trips() {
     assert_eq!(loaded.endpoints.len(), 1);
 }
 
-/// Finding #7: the state directory must be created owner-only, never with the
+/// The state directory must be created owner-only, never with the
 /// process umask (the daemon path sets umask(0), which would make the first
 /// persist create it world-writable).
 #[cfg(unix)]

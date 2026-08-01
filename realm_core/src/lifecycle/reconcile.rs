@@ -456,7 +456,7 @@ impl<S: EndpointSource> Reconciler<S> {
         // ---- removals: every id the manager still holds that nothing desires -
         // deriving the deletion set from what the manager actually serves — not
         // from `self.applied` — means an endpoint whose failed replace kept its
-        // old listener still gets deleted when a later generation drops it (#5).
+        // old listener still gets deleted when a later generation drops it.
         for id in self.manager.ids() {
             plans.entry(id).or_insert(Plan::Delete);
         }
@@ -490,7 +490,7 @@ impl<S: EndpointSource> Reconciler<S> {
                     // keep the previous applied spec: an invalid resubmission of
                     // an endpoint that is still serving must not drop it from the
                     // applied set, or a later deletion would never reach it.
-                    if !self.manager.ids().contains(&id) {
+                    if !self.manager.contains(&id) {
                         desired.remove(&id);
                     } else if let Some(prev) = self.applied.get(&id) {
                         desired.insert(id.clone(), prev.clone());
@@ -517,8 +517,7 @@ impl<S: EndpointSource> Reconciler<S> {
                         // this endpoint's address may have been released for a
                         // contended handoff; if its replacement then failed, try
                         // to put it back on its original address so a swap gone
-                        // wrong never strands a listener that was serving (#10,
-                        // R27).
+                        // wrong never strands a listener that was serving (R27).
                         if released.contains(&id) && !self.serving(&id) {
                             self.restore_released(&id, generation, previous_spec.as_ref(), &mut results)
                                 .await;
@@ -528,7 +527,7 @@ impl<S: EndpointSource> Reconciler<S> {
                         // serves: an id that kept its old listener stays applied
                         // under its *previous* spec, one that is still partly up
                         // keeps the new spec, one left with nothing is dropped so
-                        // a later generation retries it (#5, #9, R25).
+                        // a later generation retries it (R25).
                         if self.serving(&id) {
                             if let Some(prev) = previous_spec {
                                 desired.insert(id.clone(), prev);
@@ -620,7 +619,7 @@ impl<S: EndpointSource> Reconciler<S> {
     /// Best-effort: the original address is free only if the endpoint that was
     /// going to take it also failed. When the restore succeeds the endpoint is
     /// serving its previous configuration again; when it cannot, the earlier
-    /// failure already stands and nothing more is reported (#10, R27).
+    /// failure already stands and nothing more is reported (R27).
     async fn restore_released(
         &mut self,
         id: &str,
@@ -689,7 +688,7 @@ impl<S: EndpointSource> Reconciler<S> {
 
         // addresses this generation is going to release, and whether the
         // endpoint holding each is being deleted (force-close on the delete
-        // deadline) or only replaced (drain under the update policy) (#23)
+        // deadline) or only replaced (drain under the update policy)
         let mut releasing: Vec<(EndpointId, Proto, SocketAddr, bool)> = Vec::new();
         for (id, plan) in plans {
             let (leaving, deleting) = match plan {
@@ -722,7 +721,7 @@ impl<S: EndpointSource> Reconciler<S> {
                 let policy = self.manager.drain_policy(&id).unwrap_or_default();
                 // a delete keeps its force-close deadline even when the address
                 // is taken over by another endpoint; a replace drains under the
-                // update policy as it would without contention (#23)
+                // update policy as it would without contention
                 let deadline = if deleting { policy.on_delete } else { policy.on_update };
                 log::debug!(
                     "[reconcile]releasing {} on {}/{} for another endpoint",
@@ -732,7 +731,7 @@ impl<S: EndpointSource> Reconciler<S> {
                 );
                 self.manager.stop_accept(&id, proto, deadline).await;
                 // a replaced endpoint whose address was handed off is a
-                // restore candidate if its own move then fails (#10)
+                // restore candidate if its own move then fails
                 if !deleting {
                     released.insert(id);
                 }
@@ -756,7 +755,7 @@ impl<S: EndpointSource> Reconciler<S> {
                 // A panic while handling one message must not take the whole
                 // reconciler down: the handle would then degrade to "reconciler
                 // is gone" forever, poisoning every future status and submission.
-                // Catch it, answer that one request, and keep serving (#6). The
+                // Catch it, answer that one request, and keep serving. The
                 // release profile unwinds, so this is sound.
                 match message {
                     Message::Reconcile(request, reply) => {
@@ -813,7 +812,7 @@ fn into_results(id: &str, outcomes: Vec<SlotOutcome>) -> Vec<EndpointResult> {
 /// `EndpointSource::build` may resolve dns synchronously; running it on the
 /// serial consumer would stall status, readiness and every other submission.
 /// A join failure — a panic inside `build`, or a cancelled blocking pool —
-/// becomes a failed endpoint rather than a failed generation (#11, R31).
+/// becomes a failed endpoint rather than a failed generation (R31).
 async fn build_offloaded<S: EndpointSource>(spec: &S) -> Result<EndpointSpec, String> {
     let spec = spec.clone();
     match tokio::task::spawn_blocking(move || spec.build()).await {

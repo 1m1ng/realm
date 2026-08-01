@@ -58,7 +58,7 @@ struct EnvelopeRef<'a, S> {
 pub struct SnapshotStore {
     path: PathBuf,
     /// Feeds the unique temp-file name so concurrent or repeated writes never
-    /// collide on a fixed, guessable path (finding #1). Shared across clones so
+    /// collide on a fixed, guessable path. Shared across clones so
     /// two handles to the same store cannot pick the same sequence number.
     tmp_counter: Arc<AtomicU64>,
 }
@@ -120,7 +120,7 @@ impl SnapshotStore {
         // stays within one filesystem), opened with `create_new` => `O_EXCL`.
         // `O_EXCL` refuses to follow a symlink at the final component and fails
         // if the path already exists, so the write can never land on a
-        // pre-existing file (finding #1). A fixed, guessable temp name let a
+        // pre-existing file. A fixed, guessable temp name let a
         // local user pre-plant it as a symlink and have realm write straight
         // through it with realm's (typically root) privileges.
         let base_name = self.path.file_name().and_then(|n| n.to_str()).unwrap_or("snapshot");
@@ -172,8 +172,8 @@ impl SnapshotStore {
 }
 
 /// Create the snapshot's directory owner-only, so its contents — which spell
-/// out every forwarding rule — are never readable or writable by other users
-/// (finding #7). Under the daemon's `umask(0)` a plain `create_dir_all` would
+/// out every forwarding rule — are never readable or writable by other users.
+/// Under the daemon's `umask(0)` a plain `create_dir_all` would
 /// make the first persist create it world-writable. An existing directory
 /// keeps whatever mode it already has.
 #[cfg(unix)]

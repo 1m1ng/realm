@@ -6,7 +6,6 @@
 //! every error (R31, R32).
 
 use std::convert::Infallible;
-use std::time::Duration;
 
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
@@ -14,8 +13,8 @@ use hyper::{Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use realm_core::lifecycle::{
-    DesiredEndpoint, EndpointStatus, GenerationState, Proto, ReconcileError, ReconcileHandle, ReconcileRequest,
-    SlotAction, SlotState,
+    DesiredEndpoint, EndpointStatus, GenerationState, ReconcileError, ReconcileHandle, ReconcileRequest, SlotAction,
+    SlotState,
 };
 
 use crate::VERSION;
@@ -299,7 +298,7 @@ async fn reconcile(state: ApiState, req: Request<Incoming>) -> Response<BoxBody>
                         .into_iter()
                         .map(|r| EndpointResultDto {
                             id: r.id,
-                            protocol: proto_str(r.proto),
+                            protocol: r.proto.as_str(),
                             action: action_str(r.action),
                             error: r.error,
                             retryable: r.retryable,
@@ -346,7 +345,7 @@ fn endpoint_status(status: EndpointStatus) -> EndpointStatusDto {
             .slots
             .into_iter()
             .map(|slot| SlotStatusDto {
-                protocol: proto_str(slot.proto),
+                protocol: slot.proto.as_str(),
                 state: state_str(&slot.state),
                 error: match &slot.state {
                     SlotState::Failed(e) => Some(e.clone()),
@@ -361,8 +360,8 @@ fn endpoint_status(status: EndpointStatus) -> EndpointStatusDto {
                     .map(|d| DrainingDto {
                         generation: d.generation,
                         connections: d.connections,
-                        age_secs: secs(d.age),
-                        draining_for_secs: d.draining_for.map(secs),
+                        age_secs: d.age.as_secs_f64(),
+                        draining_for_secs: d.draining_for.map(|duration| duration.as_secs_f64()),
                     })
                     .collect(),
             })
@@ -435,17 +434,6 @@ fn version() -> Response<BoxBody> {
 }
 
 // ----------------------------------------------------------------- helpers --
-
-fn secs(d: Duration) -> f64 {
-    d.as_secs_f64()
-}
-
-fn proto_str(proto: Proto) -> &'static str {
-    match proto {
-        Proto::Tcp => "tcp",
-        Proto::Udp => "udp",
-    }
-}
 
 fn action_str(action: SlotAction) -> &'static str {
     match action {

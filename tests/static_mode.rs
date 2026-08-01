@@ -466,7 +466,7 @@ mod control {
         assert!(process["dns"]["nameservers"].is_array());
         assert!(process["features"].as_str().unwrap().contains("[control]"));
 
-        // finding #20: the compile-time tls backend is reported so an agent can
+        // The compile-time tls backend is reported so an agent can
         // detect provider drift, matching what docs/control-api.md promises. The
         // default build links aws-lc.
         assert_eq!(

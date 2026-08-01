@@ -46,12 +46,18 @@ pub enum Proto {
     Udp,
 }
 
+impl Proto {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Proto::Tcp => "tcp",
+            Proto::Udp => "udp",
+        }
+    }
+}
+
 impl Display for Proto {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Proto::Tcp => write!(f, "tcp"),
-            Proto::Udp => write!(f, "udp"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -260,6 +266,10 @@ impl EndpointManager {
     /// Ids currently known to the manager.
     pub fn ids(&self) -> Vec<EndpointId> {
         self.entries.keys().cloned().collect()
+    }
+
+    pub(super) fn contains(&self, id: &str) -> bool {
+        self.entries.contains_key(id)
     }
 
     /// Drain policy in effect for `id`, if the manager holds it.
@@ -522,8 +532,7 @@ impl EndpointManager {
             };
         };
 
-        let same_address =
-            active.laddr.port() == spec.endpoint.laddr.port() && active.laddr.ip() == spec.endpoint.laddr.ip();
+        let same_address = active.laddr == spec.endpoint.laddr;
         let old_generation = active.generation;
 
         if same_address {
@@ -780,7 +789,7 @@ mod refresh_tests {
     use super::*;
     use crate::endpoint::RemoteAddr;
 
-    /// #4: a serving task that exits on its own leaves the connections it
+    /// A serving task that exits on its own leaves the connections it
     /// already spawned running. `refresh` must hand that cohort to a draining
     /// task — force-closed on the delete deadline — instead of dropping it and
     /// orphaning the connections with no handle to observe or terminate them.
