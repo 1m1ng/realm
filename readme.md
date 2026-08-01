@@ -420,7 +420,30 @@ See [Kaminari Options](https://github.com/zephyrchien/kaminari#options).
 
 Require `transport` feature.
 
-See [Kaminari Options](https://github.com/zephyrchien/kaminari#options).
+See [Kaminari Options](https://github.com/zephyrchien/kaminari#options), plus
+`ca=<path>` below, which this fork adds.
+
+##### `ca=<path>`
+
+Verify the peer against the trust anchors in a PEM file instead of the public
+roots compiled into the binary:
+
+```
+tls;sni=realm.example.internal;ca=/etc/realm/pki/root.pem
+```
+
+The file may hold more than one anchor, and every certificate in it must parse
+or the endpoint fails to build with an error naming the file. The anchors
+*replace* the public roots rather than adding to them — otherwise any publicly
+trusted CA could still vouch for the name you are pinning. `ca` together with
+`insecure` is rejected, and so is an empty `ca=`; a CA file that cannot be read
+fails that endpoint rather than falling back to an unverified connection.
+
+Replacing the bytes of the file — or of a listen-side `cert=` / `key=` pair —
+is a change realm converges on: under the control plane, the next generation
+rebuilds only the endpoints naming that material. Realm does not watch the
+files; see [docs/control-api.md](docs/control-api.md) for the capability token
+and the rotation contract.
 
 #### endpoint.network
 

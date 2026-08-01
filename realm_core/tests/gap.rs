@@ -53,6 +53,7 @@ impl EndpointSource for Spec {
             tcp: true,
             udp: false,
             drain: None,
+            material: None,
         })
     }
 }

@@ -161,6 +161,17 @@ pub struct EndpointSpec {
     pub udp: bool,
     /// per-endpoint override of the drain deadlines
     pub drain: Option<DrainPolicy>,
+    /// digest of the caller-owned material this endpoint was built from, if it
+    /// was built from any
+    ///
+    /// The no-op fast path below decides "already serving this exact endpoint"
+    /// on `Endpoint`'s `Display`, which cannot see what a transport was built
+    /// *from*: two acceptors differing only in the bytes behind an unchanged
+    /// certificate path render identically. A caller that derives state from
+    /// such material — see `EndpointSource::refresh` — puts a digest of it here,
+    /// so a rotation the caller's diff already caught is not then collapsed
+    /// back into "unchanged" here and quietly discarded.
+    pub material: Option<u64>,
 }
 
 impl EndpointSpec {
@@ -225,6 +236,8 @@ struct Slot {
     /// generation of whatever is actually serving, not of the last attempt
     generation: Generation,
     endpoint: Endpoint,
+    /// digest of the material the serving endpoint was built from
+    material: Option<u64>,
     active: Option<Active>,
     draining: Vec<Draining>,
 }
@@ -489,7 +502,10 @@ impl EndpointManager {
         // to change, so its canonical `Display` — which renders every field
         // that distinguishes one endpoint from another — is the comparison.
         if let Some(slot) = self.entries.get(id).and_then(|e| e.slots.get(&proto)) {
-            if slot.active.is_some() && endpoint_unchanged(&slot.endpoint, &spec.endpoint) {
+            if slot.active.is_some()
+                && slot.material == spec.material
+                && endpoint_unchanged(&slot.endpoint, &spec.endpoint)
+            {
                 return SlotOutcome::ok(proto, SlotAction::Unchanged);
             }
         }
@@ -512,6 +528,7 @@ impl EndpointManager {
                             state: SlotState::Running,
                             generation,
                             endpoint: spec.endpoint.clone(),
+                            material: spec.material,
                             active: Some(active),
                             draining: Vec::new(),
                         },
@@ -558,6 +575,13 @@ impl EndpointManager {
                     slot.state = SlotState::Running;
                     slot.generation = generation;
                     slot.endpoint = spec.endpoint.clone();
+                    // the digest travels with the endpoint it describes. Left
+                    // behind, it would stay frozen at whatever the slot was
+                    // created with, and rotating material *back* to bytes this
+                    // slot once served would compare equal and collapse into
+                    // the no-op fast path -- a withdrawal the control plane
+                    // reports as converged and the node never performs.
+                    slot.material = spec.material;
                     slot.draining.push(spawn_drain(cohort, old_generation, drain.on_update));
                     log::info!(
                         "[lifecycle]{}/{} replaced on {} at generation {}",
@@ -602,6 +626,13 @@ impl EndpointManager {
                     slot.state = SlotState::Running;
                     slot.generation = generation;
                     slot.endpoint = spec.endpoint.clone();
+                    // the digest travels with the endpoint it describes. Left
+                    // behind, it would stay frozen at whatever the slot was
+                    // created with, and rotating material *back* to bytes this
+                    // slot once served would compare equal and collapse into
+                    // the no-op fast path -- a withdrawal the control plane
+                    // reports as converged and the node never performs.
+                    slot.material = spec.material;
                     slot.draining.push(spawn_drain(cohort, old_generation, drain.on_update));
                     log::info!(
                         "[lifecycle]{}/{} moved to {} at generation {}",
@@ -659,6 +690,7 @@ impl EndpointManager {
                     existing.state = slot.state;
                     existing.generation = slot.generation;
                     existing.endpoint = slot.endpoint;
+                    existing.material = slot.material;
                     existing.active = slot.active;
                     existing.draining.extend(slot.draining);
                 }
@@ -684,6 +716,7 @@ impl EndpointManager {
                 state: SlotState::Failed(error.to_string()),
                 generation,
                 endpoint: spec.endpoint.clone(),
+                material: spec.material,
                 active: None,
                 draining: Vec::new(),
             },
@@ -696,6 +729,9 @@ impl EndpointManager {
 /// `Endpoint` deliberately has no `PartialEq`, and its module is out of this
 /// change's scope, so equality is decided on its canonical `Display`, which
 /// spells out the listen address, every remote, and all bind/connect options.
+/// It does NOT spell out what a transport was built from, which is why the
+/// caller's `EndpointSpec::material` digest is compared beside this rather
+/// than folded into it.
 fn endpoint_unchanged(a: &Endpoint, b: &Endpoint) -> bool {
     a.to_string() == b.to_string()
 }
@@ -818,6 +854,7 @@ mod refresh_tests {
                 state: SlotState::Running,
                 generation: 7,
                 endpoint,
+                material: None,
                 // a serving task that has already returned on its own
                 active: Some(Active {
                     generation: 7,

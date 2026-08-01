@@ -120,11 +120,27 @@ async fn spawn_echo(tag: &'static str) -> SocketAddr {
     addr
 }
 
+/// An address no other test in this binary has been handed.
+///
+/// Binding port 0 asks the kernel for an ephemeral port and then releases it,
+/// so two tests running in parallel can be handed the same one — whichever
+/// endpoint binds it second fails with `AddrInUse`, and the test reading that
+/// result sees `failed` where it expected an outcome of its own. Walking a
+/// private range *below* the ephemeral one gives every caller a port to
+/// itself, and keeps them clear of whatever the kernel hands out elsewhere.
 fn free_addr() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+
+    for _ in 0..2000 {
+        let port = 20000 + NEXT.fetch_add(1, Ordering::Relaxed) % 10000;
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        // somebody outside this process may still hold it
+        if std::net::TcpListener::bind(addr).is_ok() {
+            return addr;
+        }
+    }
+    panic!("no free port in the test range");
 }
 
 /// Start a control plane over a fresh reconciler, and return its socket path.
@@ -169,6 +185,58 @@ async fn version_reports_the_contract_and_capabilities() {
     let (code, same) = call(&socket, "GET", "/v1/capabilities", None).await;
     assert_eq!(code, 200);
     assert_eq!(same["schema_version"], body["schema_version"]);
+    assert_eq!(same, body, "both routes must answer the same document");
+
+    // The version the binary reports is the manifest's, so the release tag,
+    // Cargo.toml and `realm --version` cannot drift apart -- the consuming
+    // control plane pins all three as one identity.
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+}
+
+/// The capability literal is a contract with the consuming control plane,
+/// which asserts the same string on its side. Spelled out here rather than
+/// looped over `CAPABILITIES`, because a loop over the constant renames itself
+/// along with the constant and would let a divergence through: the consuming
+/// fleet would then resolve to not-capable with both sides' tests green.
+///
+/// An older binary does not reject `ca=` -- unknown transport options are
+/// ignored -- so there is no error to detect the feature's absence by. This
+/// token is the only signal.
+#[tokio::test]
+async fn the_client_ca_capability_token_is_exactly_as_the_consumer_expects() {
+    let dir = TempDir::new("capability-literal");
+    let (socket, _shutdown) = serve(&dir, Reconciler::new()).await;
+
+    let (code, body) = call(&socket, "GET", "/v1/capabilities", None).await;
+    assert_eq!(code, 200);
+
+    let advertised: Vec<&str> = body["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+
+    #[cfg(feature = "transport")]
+    assert!(
+        advertised.contains(&"client-ca-verify"),
+        "the capability token must be spelled exactly `client-ca-verify`, got {:?}",
+        advertised
+    );
+
+    // The other direction matters just as much. A build without `transport`
+    // parses `remote_transport` off the wire and drops it -- `build_transport`
+    // is feature-gated -- so `ca=` is ignored and the peer is reached
+    // unverified. Advertising the token there would answer the probe the docs
+    // tell the control plane to trust instead of comparing versions, and the
+    // caller would believe a node verifies against its private anchor while it
+    // connects in the clear.
+    #[cfg(not(feature = "transport"))]
+    assert!(
+        !advertised.contains(&"client-ca-verify"),
+        "a build without the transport feature must not claim client-ca-verify, got {:?}",
+        advertised
+    );
 }
 
 /// Covers AE14 over http (R6, R11, R36): a desired state applied over the
@@ -582,6 +650,585 @@ async fn a_stale_socket_is_replaced_and_a_live_one_is_not() {
     // the first one is still serving
     let (code, _) = call(&socket, "GET", "/v1/version", None).await;
     assert_eq!(code, 200);
+}
+
+// ------------------------------------------------- certificate rotation ----
+//
+// Rotating a certificate replaces the bytes of a file the description names,
+// and nothing else: the agent resubmits the same document under the next
+// generation. The endpoint that references the rotated material must be
+// rebuilt on it, every other endpoint must be left alone, and a rotation that
+// produces unusable material must not take a serving listener down with it.
+
+#[cfg(feature = "transport")]
+mod rotation {
+    use super::*;
+
+    use std::sync::Once;
+
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair, KeyUsagePurpose,
+    };
+    use realm::core::kaminari::AsyncConnect;
+    use realm::core::kaminari::nop::NopConnect;
+    use realm::core::kaminari::tls::{TlsClientConf, TlsConnect};
+
+    /// The name every leaf here is issued for, and the sni every handshake
+    /// here offers.
+    const NAME: &str = "example.com";
+
+    /// A self-signed root, kept whole so a leaf can be issued from it: reading
+    /// one back out of its pem file would need a certificate parser this suite
+    /// has no other use for.
+    type Ca = CertifiedIssuer<'static, KeyPair>;
+
+    fn dn(cn: &str) -> DistinguishedName {
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, cn);
+        dn
+    }
+
+    /// The rustls provider is a process-wide singleton and installing it twice
+    /// panics; realm's binary does it once at startup, so a test that builds a
+    /// tls transport has to do the same.
+    fn install_tls_provider() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(realm::core::kaminari::install_tls_provider);
+    }
+
+    /// Write a fresh self-signed certificate for `example.com` and its key to
+    /// `cert`/`key`, handing back the root itself so a test can name the der
+    /// bytes it just wrote — and so a leaf can be issued from it.
+    ///
+    /// Real material, generated per run rather than checked in: a fixture
+    /// would eventually expire, and the acceptor really does parse what it is
+    /// handed. It is issued as a ca so the same helper serves both roles, the
+    /// anchor a client pins and the certificate a listener presents.
+    fn self_signed(cert: &Path, key: &Path, cn: &str) -> Ca {
+        let signing_key = KeyPair::generate().expect("a test key");
+
+        let mut params = CertificateParams::new(vec![String::from(NAME)]).expect("root params");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.distinguished_name = dn(cn);
+
+        let root = CertifiedIssuer::self_signed(params, signing_key).expect("a self signed root");
+
+        std::fs::write(cert, root.pem()).expect("the certificate is writable");
+        std::fs::write(key, root.key().serialize_pem()).expect("the key is writable");
+
+        root
+    }
+
+    /// A leaf for `example.com` signed by `ca`, written to `cert`/`key`.
+    ///
+    /// A trust anchor cannot double as the certificate a listener presents:
+    /// rustls rejects that outright (`CaUsedAsEndEntity`), so any test that
+    /// wants a connection to actually verify needs two certificates.
+    fn leaf_signed_by(ca: &Ca, cert: &Path, key: &Path) {
+        let signing_key = KeyPair::generate().expect("a leaf key");
+
+        let mut params = CertificateParams::new(vec![String::from(NAME)]).expect("leaf params");
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        params.distinguished_name = dn(NAME);
+
+        let leaf = params.signed_by(&signing_key, ca).expect("a leaf the root signed");
+
+        std::fs::write(cert, leaf.pem()).expect("the certificate is writable");
+        std::fs::write(key, signing_key.serialize_pem()).expect("the key is writable");
+    }
+
+    /// The leaf a tls listener actually presents on the wire.
+    ///
+    /// A real handshake against the running listener, because what the
+    /// acceptor serves is the only thing a peer can observe: verification is
+    /// off precisely so that the certificate — whichever one it turns out to
+    /// be — comes back rather than failing the connection.
+    async fn presented_leaf(addr: SocketAddr) -> Vec<u8> {
+        let connector = TlsConnect::new(
+            NopConnect {},
+            TlsClientConf {
+                sni: String::from(NAME),
+                alpn: Vec::new(),
+                insecure: true,
+                early_data: false,
+                ca: None,
+            },
+        )
+        .expect("a tls connector");
+
+        let stream = TcpStream::connect(addr).await.expect("the listener accepts");
+        let mut buf = [0u8; 0];
+        let tls = timeout(Duration::from_secs(5), connector.connect(stream, &mut buf))
+            .await
+            .expect("the handshake completes")
+            .expect("the handshake succeeds");
+
+        tls.get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .expect("the listener presented no certificate")
+            .to_vec()
+    }
+
+    fn result_for<'a>(body: &'a Value, id: &str) -> &'a Value {
+        body["results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("results is an array: {}", body))
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("no result for {}: {}", id, body))
+    }
+
+    /// A resubmission of the active generation replays its first answer, which
+    /// is right for a genuine retry and wrong once the material behind the
+    /// description has rotated: replaying "converged" for material the endpoint
+    /// is not running is a false success. The digest is what tells the two
+    /// apart — the documents are byte-identical either way.
+    #[tokio::test]
+    async fn resubmitting_a_generation_after_a_rotation_is_refused_not_replayed() {
+        install_tls_provider();
+
+        let dir = TempDir::new("ca-replay");
+        let ca = dir.0.join("ca.pem");
+        let unused_key = dir.0.join("ca.key");
+        self_signed(&ca, &unused_key, "before rotation");
+
+        let (socket, _shutdown) = serve(&dir, Reconciler::new()).await;
+        let echo = spawn_echo("v1:").await;
+
+        let endpoints = json!([{
+            "id": "trusting",
+            "listen": free_addr().to_string(),
+            "remote": echo.to_string(),
+            "remote_transport": format!("tls;sni=example.com;ca={}", ca.display()),
+        }]);
+
+        let (code, body) = call(
+            &socket,
+            "PUT",
+            "/v1/desired-state",
+            Some(&desired(1, endpoints.clone())),
+        )
+        .await;
+        assert_eq!(code, 200, "{}", body);
+        assert_eq!(result_for(&body, "trusting")["action"], "created");
+
+        // a genuine retry: nothing moved, so the first answer is replayed
+        let (code, body) = call(
+            &socket,
+            "PUT",
+            "/v1/desired-state",
+            Some(&desired(1, endpoints.clone())),
+        )
+        .await;
+        assert_eq!(code, 200, "{}", body);
+        assert_eq!(result_for(&body, "trusting")["action"], "created", "{}", body);
+
+        // the same document, but the material under it has been replaced
+        self_signed(&ca, &unused_key, "after rotation");
+
+        let (code, body) = call(&socket, "PUT", "/v1/desired-state", Some(&desired(1, endpoints))).await;
+        assert_eq!(
+            code, 409,
+            "a rotation under the active generation must not replay a converged answer: {}",
+            body
+        );
+        assert_eq!(body["error"]["kind"], "stale-generation");
+        assert_eq!(body["error"]["active_generation"], 1);
+    }
+
+    /// Replacing the bytes behind a client's trust anchor must rebuild the
+    /// endpoint that names it — under a byte-identical description — and no
+    /// other endpoint.
+    #[tokio::test]
+    async fn rotating_a_trust_anchor_rebuilds_only_the_referencing_endpoint() {
+        install_tls_provider();
+
+        let dir = TempDir::new("ca-rotation");
+        let ca = dir.0.join("ca.pem");
+        let unused_key = dir.0.join("ca.key");
+        self_signed(&ca, &unused_key, "before rotation");
+
+        let (socket, _shutdown) = serve(&dir, Reconciler::new()).await;
+        let echo = spawn_echo("v1:").await;
+
+        let endpoints = json!([
+            {
+                "id": "trusting",
+                "listen": free_addr().to_string(),
+                "remote": echo.to_string(),
+                "remote_transport": format!("tls;sni=example.com;ca={}", ca.display()),
+            },
+            { "id": "bystander", "listen": free_addr().to_string(), "remote": echo.to_string() },
+        ]);
+
+        let endpoints_for_rollback = endpoints.clone();
+        // the exact bytes generation 1 serves, so the rollback below restores
+        // material this endpoint has already been built on rather than issuing
+        // a fresh certificate that merely shares a subject
+        let original_anchor = std::fs::read(&ca).expect("the anchor is readable");
+
+        let (code, body) = call(
+            &socket,
+            "PUT",
+            "/v1/desired-state",
+            Some(&desired(1, endpoints.clone())),
+        )
+        .await;
+        assert_eq!(code, 200, "{}", body);
+        assert_eq!(result_for(&body, "trusting")["action"], "created");
+        assert_eq!(result_for(&body, "bystander")["action"], "created");
+
+        // the anchor is replaced in place: the description does not change
+        self_signed(&ca, &unused_key, "after rotation");
+
+        let (code, body) = call(&socket, "PUT", "/v1/desired-state", Some(&desired(2, endpoints))).await;
+        assert_eq!(code, 200, "{}", body);
+        assert_eq!(
+            result_for(&body, "trusting")["action"],
+            "updated",
+            "the endpoint naming the rotated anchor must be rebuilt on it: {}",
+            body
+        );
+        assert_eq!(
+            result_for(&body, "bystander")["action"],
+            "unchanged",
+            "a rotation must not churn endpoints that name no material: {}",
+            body
+        );
+
+        // Rolling back to material the endpoint already served once is the case
+        // that catches a digest frozen at slot creation: the desired state is
+        // byte-identical to generation 1's, so an endpoint whose remembered
+        // digest never advanced compares equal and collapses into the manager's
+        // no-op fast path -- the withdrawal is reported as converged and never
+        // performed.
+        std::fs::write(&ca, &original_anchor).expect("the anchor is writable");
+
+        let (code, body) = call(
+            &socket,
+            "PUT",
+            "/v1/desired-state",
+            Some(&desired(3, endpoints_for_rollback)),
+        )
+        .await;
+        assert_eq!(code, 200, "{}", body);
+        assert_eq!(
+            result_for(&body, "trusting")["action"],
+            "updated",
+            "rolling material back to bytes this endpoint already served must \
+             still rebuild it -- a frozen digest would report unchanged: {}",
+            body
+        );
+        assert_eq!(
+            result_for(&body, "bystander")["action"],
+            "unchanged",
+            "the rollback must not churn endpoints that name no material: {}",
+            body
+        );
+    }
+
+    /// A `ca=` naming a file that is not there must fail that endpoint and be
+    /// reported as such. The alternative — building on the public bundle and
+    /// reporting success — is a downgrade the agent has no way to notice.
+    #[tokio::test]
+    async fn an_absent_trust_anchor_fails_only_its_own_endpoint() {
+        install_tls_provider();
+
+        let dir = TempDir::new("ca-absent");
+        let missing = dir.0.join("nowhere.pem");
+
+        let (socket, _shutdown) = serve(&dir, Reconciler::new()).await;
+        let echo = spawn_echo("v1:").await;
+        let bystander_addr = free_addr();
+
+        let (code, body) = call(
+            &socket,
+            "PUT",
+            "/v1/desired-state",
+            Some(&desired(
+                1,
+                json!([
+                    {
+                        "id": "trusting",
+                        "listen": free_addr().to_string(),
+                        "remote": echo.to_string(),
+                        "remote_transport": format!("tls;sni=example.com;ca={}", missing.display()),
+                    },
+                    { "id": "bystander", "listen": bystander_addr.to_string(), "remote": echo.to_string() },
+                ]),
+            )),
+        )
+        .await;
+
+        assert_eq!(code, 200, "a partial failure is still a processed request: {}", body);
+        assert_eq!(
+            body["state"], "partially-applied",
+            "a generation one of whose endpoints failed is partially applied: {}",
+            body
+        );
+
+        let trusting = result_for(&body, "trusting");
+        assert_eq!(
+            trusting["action"], "failed",
+            "a trust anchor that is not there must fail the endpoint: {}",
+            body
+        );
+        let error = trusting["error"].as_str().unwrap_or_else(|| panic!("{}", body));
+        assert!(
+            error.contains(&missing.display().to_string()),
+            "the reported error must name the material: {}",
+            error
+        );
+
+        assert_eq!(
+            result_for(&body, "bystander")["action"],
+            "created",
+            "one endpoint's unusable material must not fail its siblings: {}",
+            body
+        );
+
+        // the sibling is not merely reported as created, it is serving
+        let mut probe = TcpStream::connect(bystander_addr).await.unwrap();
+        probe.write_all(b"ping").await.unwrap();
+        let mut buf = vec![0u8; 64];
+        let n = timeout(Duration::from_secs(5), probe.read(&mut buf))
+            .await
+            .expect("the sibling answers")
+            .unwrap();
+        assert_eq!(&buf[..n], b"v1:ping");
+    }
+
+    /// The same for a server: after the rotation the listener presents the new
+    /// leaf, which is the only thing a peer can actually observe. This is what
+    /// a resolver cached by key path would defeat: the rebuilt acceptor would
+    /// hand back the material the first construction happened to read.
+    #[tokio::test]
+    async fn rotating_a_leaf_makes_the_listener_present_it() {
+        install_tls_provider();
+
+        let dir = TempDir::new("leaf-rotation");
+        let cert = dir.0.join("cert.pem");
+        let key = dir.0.join("key.pem");
+        let first = self_signed(&cert, &key, "before rotation").der().to_vec();
+
+        let (socket, _shutdown) = serve(&dir, Reconciler::new()).await;
+        let echo = spawn_echo("v1:").await;
+        let laddr = free_addr();
+
+        let endpoints = json!([{
+            "id": "server",
+            "listen": laddr.to_string(),
+            "remote": echo.to_string(),
+            "listen_transport": format!("tls;cert={};key={}", cert.display(), key.display()),
+        }]);
+
+        let (code, body) = call(
+            &socket,
+            "PUT",
+            "/v1/desired-state",
+            Some(&desired(1, endpoints.clone())),
+        )
+        .await;
+        assert_eq!(code, 200, "{}", body);
+        assert_eq!(result_for(&body, "server")["action"], "created");
+
+        assert_eq!(presented_leaf(laddr).await, first, "the listener presents its leaf");
+
+        // rotate both halves in place
+        let second = self_signed(&cert, &key, "after rotation").der().to_vec();
+        assert_ne!(first, second, "the rotation produced a different leaf");
+
+        let (code, body) = call(&socket, "PUT", "/v1/desired-state", Some(&desired(2, endpoints))).await;
+        assert_eq!(code, 200, "{}", body);
+        assert_eq!(result_for(&body, "server")["action"], "updated", "{}", body);
+
+        assert_eq!(
+            presented_leaf(laddr).await,
+            second,
+            "the rebuilt acceptor must present the rotated leaf"
+        );
+    }
+
+    /// A rotation that produced unusable material must fail that endpoint and
+    /// leave its listener serving on the material it already has — and must not
+    /// record the broken state as applied.
+    ///
+    /// The peer is a second endpoint terminating tls on the very leaf the
+    /// anchor pins, so "still serving" is answered by real traffic over a
+    /// verified connection rather than by the listener merely accepting.
+    #[tokio::test]
+    async fn a_corrupt_anchor_fails_the_endpoint_without_disturbing_its_listener() {
+        install_tls_provider();
+
+        let dir = TempDir::new("ca-corrupt");
+        let ca = dir.0.join("ca.pem");
+        let ca_key = dir.0.join("ca.key");
+        let root = self_signed(&ca, &ca_key, "realm test root");
+
+        // the peer presents a leaf the anchor signed, and reads neither of the
+        // two root files: corrupting what the client trusts must leave the
+        // server's own material alone, or one rotation would fail both
+        let leaf = dir.0.join("leaf.pem");
+        let leaf_key = dir.0.join("leaf.key");
+        leaf_signed_by(&root, &leaf, &leaf_key);
+
+        let intact = std::fs::read(&ca).unwrap();
+
+        let (socket, _shutdown) = serve(&dir, Reconciler::new()).await;
+        let echo = spawn_echo("v1:").await;
+        let laddr = free_addr();
+        let peer = free_addr();
+
+        let endpoints = json!([
+            {
+                "id": "trusting",
+                "listen": laddr.to_string(),
+                "remote": peer.to_string(),
+                "remote_transport": format!("tls;sni=example.com;ca={}", ca.display()),
+            },
+            {
+                "id": "peer",
+                "listen": peer.to_string(),
+                "remote": echo.to_string(),
+                "listen_transport": format!("tls;cert={};key={}", leaf.display(), leaf_key.display()),
+            },
+        ]);
+
+        let (code, body) = call(
+            &socket,
+            "PUT",
+            "/v1/desired-state",
+            Some(&desired(1, endpoints.clone())),
+        )
+        .await;
+        assert_eq!(code, 200, "{}", body);
+        assert_eq!(result_for(&body, "trusting")["action"], "created");
+        assert_eq!(result_for(&body, "peer")["action"], "created");
+
+        let mut established = TcpStream::connect(laddr).await.unwrap();
+
+        std::fs::write(&ca, b"this is not a certificate").unwrap();
+
+        let (code, body) = call(
+            &socket,
+            "PUT",
+            "/v1/desired-state",
+            Some(&desired(2, endpoints.clone())),
+        )
+        .await;
+        assert_eq!(code, 200, "{}", body);
+        assert_eq!(
+            result_for(&body, "trusting")["action"],
+            "failed",
+            "unusable material must fail the endpoint: {}",
+            body
+        );
+
+        // the listener the failed rotation could not replace is still serving
+        established.write_all(b"ping").await.unwrap();
+        let mut buf = vec![0u8; 64];
+        let n = timeout(Duration::from_secs(5), established.read(&mut buf))
+            .await
+            .expect("the established connection still answers")
+            .unwrap();
+        assert_eq!(&buf[..n], b"v1:ping");
+        assert!(
+            TcpStream::connect(laddr).await.is_ok(),
+            "the listener is still accepting"
+        );
+
+        // the applied digest never moved to the broken material: putting the
+        // original bytes back leaves nothing to do
+        std::fs::write(&ca, &intact).unwrap();
+        let (code, body) = call(&socket, "PUT", "/v1/desired-state", Some(&desired(3, endpoints))).await;
+        assert_eq!(code, 200, "{}", body);
+        assert_eq!(
+            result_for(&body, "trusting")["action"],
+            "unchanged",
+            "the failed rotation must not have been recorded as applied: {}",
+            body
+        );
+    }
+
+    /// The invariant behind the scenario above, on material the acceptor does
+    /// read today: a rebuild that cannot produce a working endpoint fails that
+    /// endpoint, keeps the running listener, and is not recorded as applied.
+    ///
+    /// The last third is the one that needs construction to return an error
+    /// rather than panic: a panic taken inside the shared resolver mutex used
+    /// to poison it for the life of the process, which failed every later
+    /// server construction in this binary, including this test's own final
+    /// `unchanged`.
+    #[tokio::test]
+    async fn a_failed_rebuild_leaves_the_serving_listener_alone() {
+        install_tls_provider();
+
+        let dir = TempDir::new("leaf-corrupt");
+        let cert = dir.0.join("cert.pem");
+        let key = dir.0.join("key.pem");
+        let leaf = self_signed(&cert, &key, "serving").der().to_vec();
+
+        // unusable material under a path of its own: the rebuild has to be
+        // driven by a change in the description, not only in the bytes
+        let broken_cert = dir.0.join("broken.pem");
+        let broken_key = dir.0.join("broken.key");
+        std::fs::write(&broken_cert, b"this is not a certificate").unwrap();
+        std::fs::write(&broken_key, b"this is not a private key").unwrap();
+
+        let (socket, _shutdown) = serve(&dir, Reconciler::new()).await;
+        let echo = spawn_echo("v1:").await;
+        let laddr = free_addr();
+
+        let working = json!([{
+            "id": "server",
+            "listen": laddr.to_string(),
+            "remote": echo.to_string(),
+            "listen_transport": format!("tls;cert={};key={}", cert.display(), key.display()),
+        }]);
+        let broken = json!([{
+            "id": "server",
+            "listen": laddr.to_string(),
+            "remote": echo.to_string(),
+            "listen_transport": format!("tls;cert={};key={}", broken_cert.display(), broken_key.display()),
+        }]);
+
+        let (code, body) = call(&socket, "PUT", "/v1/desired-state", Some(&desired(1, working.clone()))).await;
+        assert_eq!(code, 200, "{}", body);
+        assert_eq!(result_for(&body, "server")["action"], "created");
+
+        assert_eq!(presented_leaf(laddr).await, leaf);
+
+        let (code, body) = call(&socket, "PUT", "/v1/desired-state", Some(&desired(2, broken))).await;
+        assert_eq!(code, 200, "{}", body);
+        assert_eq!(
+            result_for(&body, "server")["action"],
+            "failed",
+            "unusable material must fail the endpoint: {}",
+            body
+        );
+
+        assert_eq!(
+            presented_leaf(laddr).await,
+            leaf,
+            "the listener must keep serving the material it already has"
+        );
+
+        // the broken description was never recorded as applied
+        let (code, body) = call(&socket, "PUT", "/v1/desired-state", Some(&desired(3, working))).await;
+        assert_eq!(code, 200, "{}", body);
+        assert_eq!(
+            result_for(&body, "server")["action"],
+            "unchanged",
+            "the failed rebuild must not have been recorded as applied: {}",
+            body
+        );
+    }
 }
 
 /// Covers R15 over http: an endpoint removed from the desired state releases

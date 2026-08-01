@@ -107,6 +107,7 @@ impl TryFrom<LegacyConf> for FullConf {
                 balance: None,
                 update_drain_timeout: None,
                 delete_drain_timeout: None,
+                material_digest: None,
             })
             .collect();
 

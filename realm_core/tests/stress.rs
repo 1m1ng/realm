@@ -53,6 +53,7 @@ impl EndpointSource for Spec {
                 on_update: Some(Duration::from_millis(200)),
                 on_delete: Some(Duration::from_millis(200)),
             }),
+            material: None,
         })
     }
 }

@@ -116,7 +116,7 @@ Answer, `200`:
     }
   ],
   "process": {
-    "version": "2.9.4",
+    "version": "2.10.0",
     "features": "[brutal][batched-udp][proxy][balance][transport][control][multi-thread]",
     "dns": { "nameservers": ["10.0.0.53"] },
     "log_level": "info",
@@ -152,7 +152,7 @@ The same document either way:
 ```json
 {
   "implementation": "realm-hot-reload-fork",
-  "version": "2.9.4",
+  "version": "2.10.0",
   "schema_version": 1,
   "capabilities": ["desired-state-reconcile", "..."],
   "features": "[brutal][...]"
@@ -162,6 +162,56 @@ The same document either way:
 Probe this before anything else: upstream realm has no control socket at all,
 so a failed connect means "not this fork". Use `capabilities` rather than
 version comparisons to decide what you may rely on.
+
+#### `client-ca-verify`
+
+A node advertising this token verifies TLS peers against a trust anchor you
+supply, and converges on replaced certificate material.
+
+`remote_transport` accepts `ca=<path>`, a PEM file holding one or more trust
+anchors:
+
+```
+tls;sni=realm.example.internal;ca=/etc/realm/pki/root.pem
+```
+
+The anchors in that file **replace** the compiled-in public roots rather than
+adding to them — otherwise any publicly trusted CA could still vouch for your
+internal name. Every certificate in the file must parse, or the endpoint fails
+to build; a bundle that silently lost an entry would leave a node trusting one
+anchor during a dual-root rotation with nothing to say so. `ca` together with
+`insecure` is rejected, as is an empty `ca=`.
+
+An endpoint whose CA file is missing or unparseable **fails, alone**. It does
+not fall back to an unverified connection, it does not disturb its siblings,
+and the generation lands as `partially-applied` with that endpoint `failed` and
+an error naming the file. Heal it by submitting a later generation, as with any
+other per-endpoint failure.
+
+Certificate material is part of an endpoint's desired state. Replace the bytes
+behind `ca=`, or behind a listen-side `cert=` / `key=`, and the next generation
+you submit rebuilds **only** the endpoints naming that material — even when the
+configuration you send is byte-identical to the one before. Endpoints that name
+none report `unchanged` and keep their established connections, and the process
+is never restarted.
+
+Two consequences worth planning for:
+
+- Realm does not watch or poll these files. Your submission is the only trigger,
+  so a rotation converges when you next submit, not when the file changes.
+- Resubmitting the *active* generation after material changed is refused as a
+  conflict rather than replayed. Replaying the old answer would report
+  convergence for material the endpoint is no longer running. Advance the
+  generation instead.
+
+**Probe for the token, do not compare versions.** A binary without this feature
+does not reject `ca=` — unknown transport options are ignored — so it accepts
+the same string and quietly verifies against the public roots instead.
+
+Rotating material safely also depends on your side: write the replacement to a
+temporary file and rename it into place. Realm digests the file and then reads
+it again at construction, so a torn read costs at most one spurious rebuild —
+but only if the file is never observed half-written.
 
 ## What a change does to live traffic
 
