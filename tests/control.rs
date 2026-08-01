@@ -489,7 +489,7 @@ async fn an_existing_directory_keeps_its_permissions() {
     assert_eq!(code, 200);
 }
 
-/// Covers R12/R30 (finding #13): the freshly-bound control socket is owner-only
+/// The freshly-bound control socket is owner-only
 /// at creation, even under a permissive umask and in a group/world-reachable
 /// parent directory. Binding under `umask(0)` (the state a daemonized realm is
 /// in) would otherwise create the socket 0o777 — world-connectable in the

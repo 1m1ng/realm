@@ -239,7 +239,7 @@ async fn validation_has_no_side_effect() {
     assert!(lis.is_ok(), "validation must not bind anything");
 }
 
-/// #15: a spec that enables neither protocol is rejected by validation, which
+/// A spec that enables neither protocol is rejected by validation, which
 /// has no protocol to report under — it must still produce an outcome so the
 /// generation is seen as failed instead of silently applied.
 #[tokio::test]
@@ -267,7 +267,7 @@ async fn a_spec_with_no_protocol_is_reported_failed_not_silently_applied() {
     assert!(outcome[0].error.as_deref().unwrap_or_default().contains("neither"));
 }
 
-/// #22: a same-address udp replacement while an association is alive. The old
+/// A same-address udp replacement while an association is alive. The old
 /// listener is replaced, the manager reports it updated, and a fresh datagram
 /// reaches the new remote.
 ///

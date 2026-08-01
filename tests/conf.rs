@@ -138,7 +138,7 @@ fn cli_rejects_invalid_config_with_nonzero_exit() {
 // The load balancer and transport option strings are handed to third-party
 // parsers (`realm_lb`, `kaminari`) that `panic!` on malformed input. Since a
 // control-plane request reaches `EndpointConf::build` on the reconciler task, a
-// panic there would take the whole control plane down (finding #2). Building
+// panic there would take the whole control plane down. Building
 // must reject every malformed value with a structured error instead.
 
 #[cfg(feature = "balance")]

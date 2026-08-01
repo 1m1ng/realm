@@ -453,7 +453,7 @@ async fn a_failed_endpoint_is_retried_by_the_next_generation() {
     assert_eq!(ask(&mut stream, b"x").await, "v1:x");
 }
 
-/// #5: a replace whose bind fails keeps the old listener serving, so the id is
+/// A replace whose bind fails keeps the old listener serving, so the id is
 /// still one the manager holds — a later empty desired state must delete it,
 /// not report success while it keeps accepting traffic.
 #[tokio::test]
@@ -499,7 +499,7 @@ async fn a_failed_replacement_is_still_deleted_by_a_later_empty_state() {
     assert!(TcpListener::bind(x).await.is_ok(), "x must be released");
 }
 
-/// #9: one protocol failing must not evict the healthy sibling. Resubmitting
+/// One protocol failing must not evict the healthy sibling. Resubmitting
 /// the same desired state reports the healthy protocol `unchanged` and retries
 /// only the failed one, never stopping and rebinding the one that was serving.
 #[tokio::test]
@@ -542,7 +542,7 @@ async fn a_partial_protocol_failure_leaves_the_healthy_sibling_untouched() {
     assert_eq!(ask(&mut established, b"y").await, "v1:y");
 }
 
-/// #21: a failed endpoint the agent stops declaring must disappear from status,
+/// A failed endpoint the agent stops declaring must disappear from status,
 /// instead of lingering forever because it was never part of `applied`.
 #[tokio::test]
 async fn a_dropped_failed_endpoint_disappears_from_status() {
@@ -571,7 +571,7 @@ async fn a_dropped_failed_endpoint_disappears_from_status() {
     );
 }
 
-/// #24: a new endpoint colliding with a still-listening `unchanged` incumbent
+/// A new endpoint colliding with a still-listening `unchanged` incumbent
 /// must fail as a deterministic terminal duplicate, not race into a retryable
 /// address-in-use — and the incumbent must be untouched (R28).
 #[tokio::test]
@@ -614,7 +614,7 @@ async fn a_new_endpoint_colliding_with_an_unchanged_incumbent_is_terminal() {
     assert_eq!(ask(&mut on_a, b"x").await, "v1:x");
 }
 
-/// #23: a deleted endpoint whose address is taken over by another endpoint of
+/// A deleted endpoint whose address is taken over by another endpoint of
 /// the same generation must still force-close its connections on the delete
 /// deadline, not drain them indefinitely.
 #[tokio::test]
@@ -650,7 +650,7 @@ async fn a_delete_keeps_its_force_close_deadline_when_its_address_is_taken_over(
     assert_eq!(n, 0, "the lingering connection must be closed");
 }
 
-/// #10: an address swap where one side's new config is bind-invalid must not
+/// An address swap where one side's new config is bind-invalid must not
 /// permanently strand a listener that was serving. The side whose address was
 /// released for the handoff is put back on its original address once the taker
 /// fails, and the taker keeps its own old listener (R27).
@@ -704,7 +704,7 @@ async fn an_address_swap_with_a_bind_invalid_side_never_strands_a_listener() {
     assert_eq!(ask(&mut on_x, b"q").await, "z1:q");
 }
 
-/// #17: two controllers reusing one generation for different desired states must
+/// Two controllers reusing one generation for different desired states must
 /// not both be told the first one succeeded. A same-generation content mismatch
 /// is a terminal refusal, while an identical resubmission still replays (R8).
 #[tokio::test]
@@ -747,7 +747,7 @@ async fn a_same_generation_with_different_content_is_refused() {
 }
 
 /// A desired-state shape whose spec comparison panics, used only to prove the
-/// reconciler survives a panic while handling one request (#6).
+/// reconciler survives a panic while handling one request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PanicSpec {
     listen: String,
@@ -782,7 +782,7 @@ impl EndpointSource for PanicSpec {
     }
 }
 
-/// #6: a panic while handling one request must not permanently kill the
+/// A panic while handling one request must not permanently kill the
 /// reconciler. The panicking request is answered with an error and the loop
 /// keeps serving every later request.
 #[tokio::test]
